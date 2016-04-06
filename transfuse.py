@@ -1,15 +1,32 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import re
 import sys
 import socket
 import logging
 import logging.config
-from backports.configparser import ConfigParser
+from ConfigParser import ConfigParser
 
 import peewee
 from openprocurement_client.client import TendersClient
 
 logger = logging.getLogger('transfuse')
+
+
+class MyConfigParser(ConfigParser):
+    OPTCRE = re.compile(
+        r'(?P<option>[^=\s][^=]*)'
+        r'\s*(?P<vi>[=])\s*'
+        r'(?P<value>.*)$'
+        )
+    OPTCRE_NV = re.compile(
+        r'(?P<option>[^=\s][^=]*)'
+        r'\s*(?:'
+        r'(?P<vi>[=])\s*'
+        r'(?P<value>.*))?$'
+        )
+    def optionxform(self, optionstr):
+        return optionstr
 
 
 class MyClient(TendersClient):
@@ -66,8 +83,8 @@ class TendersToMySQL(object):
         func = None
         if key.find(':') > 0:
             func, key = key.split(':', 1)
-        childs = key.split('.')
-        for key in childs:
+        chain = key.split('.')
+        for key in chain:
             if isinstance(data, list):
                 res = list()
                 for item in data:
@@ -131,11 +148,6 @@ class TendersToMySQL(object):
         # endwhile
 
 
-class MyConfigParser(ConfigParser):
-    def optionxform(self, optionstr):
-        return optionstr
-
-
 def main():
     if len(sys.argv) < 2:
         print("Usage: transfuse config.ini")
@@ -143,7 +155,7 @@ def main():
 
     logging.config.fileConfig(sys.argv[1])
 
-    parser = MyConfigParser(allow_no_value=True, delimiters='=')
+    parser = MyConfigParser(allow_no_value=True)
     parser.read(sys.argv[1])
 
     client_config = parser.items('client')
