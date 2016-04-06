@@ -165,9 +165,11 @@ class TendersToMySQL(object):
 
             if not tenders_list:
                 if self.c_continue:
+                    logger.info("Wait before next loop...")
                     sleep(10)
                 else:
                     break
+
         # endwhile
 
 
