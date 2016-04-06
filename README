@@ -1,0 +1,5 @@
+OpenProcurement API to MySQL bridge
+
+command line tool
+
+usage: python transfuse.py tenders.ini
