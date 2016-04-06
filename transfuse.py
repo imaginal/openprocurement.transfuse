@@ -5,6 +5,7 @@ import sys
 import socket
 import logging
 import logging.config
+from time import sleep
 from ConfigParser import ConfigParser
 
 import peewee
@@ -43,6 +44,7 @@ class TendersToMySQL(object):
         'api_version': '2.2',
         'params': {},
         'timeout': 30,
+        'continue': False,
         'resource': None,
         'skip_until': None,
         'max_count': 0,
@@ -67,6 +69,7 @@ class TendersToMySQL(object):
         self.table_schema.update(table_schema)
         # tenders client
         self.timeout = float(self.client_config.pop('timeout'))
+        self.c_continue = self.client_config.pop('continue')
         self.skip_until = self.client_config.pop('skip_until')
         self.max_count = int(self.client_config.pop('max_count'))
         self.client = MyClient(**self.client_config)
@@ -103,13 +106,16 @@ class TendersToMySQL(object):
         return data
 
     def create_table(self):
-        fields = dict(_id=peewee.PrimaryKeyField(primary_key=True))
+        fields = dict() # _id=peewee.PrimaryKeyField(primary_key=True)
         for key,val in self.table_schema.items():
             name = self.field_name(key)
             fieldtype = peewee.__dict__.get(val)
             if not fieldtype:
                 raise ValueError("Invalid filed type: %s", val)
-            fields[name] = fieldtype(null=True)
+            fieldopts = dict(null=True)
+            if key == 'id':
+                fieldopts['primary_key'] = True
+            fields[name] = fieldtype(**fieldopts)
         self.model_class = type('TenderModel', (self.BaseTendersModel,), fields)
         self.model_class._meta.database = self.mysql_db
         self.model_class._meta.db_table = self.db_table
@@ -121,22 +127,33 @@ class TendersToMySQL(object):
         data = self.client.get_tender(tender.id)['data']
         fields = dict()
         for key,val in self.table_schema.items():
-            name = self.field_name(key)
-            fields[name] = self.filed_value(key, data)
+            value = self.filed_value(key, data)
+            if value is not None:
+                name = self.field_name(key)
+                fields[name] = value
         item = self.model_class(**fields)
-        item.save(force_insert=True)
+        try:
+            item.save(force_insert=True)
+        except peewee.IntegrityError:
+            if not getattr(item, 'id', None):
+                raise
+            logger.warning("Update %s %s", tender.id, tender.dateModified)
+            self.model_class.delete().where(
+                self.model_class.id==item.id).execute()
+            item.save(force_insert=True)
 
     def run(self):
         self.should_stop = False
         while not self.should_stop:
             socket.setdefaulttimeout(self.timeout)
             tenders_list = self.client.get_tenders()
+
             for tender in tenders_list:
                 if self.skip_until and self.skip_until > tender.dateModified:
-                    logger.debug("Ignore ID=%s DM=%s", tender.id, tender.dateModified)
+                    logger.debug("Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
-                logger.info("Process ID=%s DM=%s", tender.id, tender.dateModified)
+                logger.info("Process %s %s", tender.id, tender.dateModified)
                 self.process_tender(tender)
 
                 if self.max_count:
@@ -145,6 +162,12 @@ class TendersToMySQL(object):
                         logger.info("Reached max_count, stop.")
                         return
             # endfor
+
+            if not tenders_list:
+                if self.c_continue:
+                    sleep(10)
+                else:
+                    break
         # endwhile
 
 
