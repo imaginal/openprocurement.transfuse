@@ -4,7 +4,6 @@ import sys
 import socket
 import logging
 import logging.config
-import simplejson as json
 from backports.configparser import ConfigParser
 
 import peewee
@@ -13,13 +12,21 @@ from openprocurement_client.client import TendersClient
 logger = logging.getLogger('transfuse')
 
 
+class MyClient(TendersClient):
+    def __init__(self, key, host_url, api_version, params=None, resource=None):
+        super(MyClient, self).__init__(key, host_url, api_version, params)
+        if resource:
+            self.prefix_path = '/api/{}/{}'.format(api_version, resource)
+
+
 class TendersToMySQL(object):
     client_config = {
         'key': '',
         'host_url': "https://api-sandbox.openprocurement.org",
         'api_version': '2.2',
         'params': {},
-        'timeout': 10,
+        'timeout': 30,
+        'resource': None,
         'skip_until': None,
         'max_count': 0,
     }
@@ -42,10 +49,10 @@ class TendersToMySQL(object):
         self.mysql_config.update(mysql_config)
         self.table_schema.update(table_schema)
         # tenders client
-        self.timeout = self.client_config.pop('timeout')
+        self.timeout = float(self.client_config.pop('timeout'))
         self.skip_until = self.client_config.pop('skip_until')
         self.max_count = int(self.client_config.pop('max_count'))
-        self.client = TendersClient(**self.client_config)
+        self.client = MyClient(**self.client_config)
         # peewee mysql
         self.db_name = self.mysql_config.pop('db')
         self.db_table = self.mysql_config.pop('db_table')
@@ -109,10 +116,10 @@ class TendersToMySQL(object):
             tenders_list = self.client.get_tenders()
             for tender in tenders_list:
                 if self.skip_until and self.skip_until > tender.dateModified:
-                    logger.debug("Ignore T=%s D=%s", tender.id, tender.dateModified)
+                    logger.debug("Ignore ID=%s DM=%s", tender.id, tender.dateModified)
                     continue
 
-                logger.info("Process T=%s D=%s", tender.id, tender.dateModified)
+                logger.info("Process ID=%s DM=%s", tender.id, tender.dateModified)
                 self.process_tender(tender)
 
                 if self.max_count:
