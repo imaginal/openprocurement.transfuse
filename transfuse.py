@@ -77,7 +77,7 @@ class TendersToMySQL(object):
         self.db_name = self.mysql_config.pop('db')
         self.db_table = self.mysql_config.pop('db_table')
         self.mysql_db = peewee.MySQLDatabase(self.db_name, **self.mysql_config)
-        self.create_table()
+        self.create_model_class()
 
     def field_name(self, key):
         return key.replace('.', '_').replace(':', '_').lower()
@@ -101,11 +101,13 @@ class TendersToMySQL(object):
                 data = data.get(key)
             if not data:
                 return
+        if isinstance(data, basestring) and len(data) > 999:
+            data = data[:999]
         if func == 'count':
             data = len(data)
         return data
 
-    def create_table(self):
+    def create_model_class(self):
         fields = dict() # _id=peewee.PrimaryKeyField(primary_key=True)
         for key,val in self.table_schema.items():
             name = self.field_name(key)
@@ -113,6 +115,11 @@ class TendersToMySQL(object):
             if not fieldtype:
                 raise ValueError("Invalid filed type: %s", val)
             fieldopts = dict(null=True)
+            if val == 'CharField' and key != 'id':
+                fieldopts['max_length'] = 1000
+            if val == 'DecimalField':
+                fieldopts['max_digits'] = 15
+                fieldopts['decimal_places'] = 2
             if key == 'id':
                 fieldopts['primary_key'] = True
             fields[name] = fieldtype(**fieldopts)
@@ -120,8 +127,10 @@ class TendersToMySQL(object):
         self.model_class._meta.database = self.mysql_db
         self.model_class._meta.db_table = self.db_table
         # create model instance, drop and create table
-        self.model_class.drop_table(fail_silently=True)
-        self.model_class.create_table()
+        try:
+            self.model_class.select().count()
+        except:
+            self.model_class.create_table()
 
     def process_tender(self, tender):
         data = self.client.get_tender(tender.id)['data']
