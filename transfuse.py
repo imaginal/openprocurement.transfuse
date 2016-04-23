@@ -62,7 +62,6 @@ class TendersToMySQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
-        'nonstop': False,
     }
     server_config = {
         'class': 'MySQLDatabase',
