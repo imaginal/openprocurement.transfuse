@@ -7,7 +7,7 @@ Can be used with databases:
 * SqliteDatabase
 * PostgresqlDatabase
 * MySQLDatabase
-* and other via peewee
+* ... and other supported by peewee
 
 Usage
 ----------
