@@ -14,6 +14,14 @@ Usage
     usage: transfuse.py [-h] [--offset OFFSET] [--limit LIMIT] [--resume]
                         base.ini [tender.ini lots.ini ...]
 
+
+Requirements
+----------
+
+* Python 2.7
+* virtualenv
+
+
 Installation
 ----------
 
