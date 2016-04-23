@@ -125,10 +125,13 @@ class TendersToMySQL(object):
         model_class.create_table()
 
     def init_model(self, table_name, table_schema):
+        if table_name in self.models:
+            raise IndexError('Model %s already exists', table_name)
         logger.info("Create model %s", table_name)
         fields = dict()
         parsed_schema = list()
         table_options = dict()
+        has_primary_key = False
 
         for key,val in table_schema:
             if key.startswith('__'):
@@ -143,7 +146,9 @@ class TendersToMySQL(object):
             fieldtype, fieldopts = self.field_types.get(opts[0])
             if len(opts) > 1:
                 fieldopts = dict(fieldopts)
-                fieldopts[opts[1]] = True
+                fieldopts[ opts[1] ] = True
+                if opts[1] == 'primary_key':
+                    has_primary_key = True
             if len(opts) > 2:
                 fieldopts['max_length'] = int(opts[2])
             fields[name] = fieldtype(**fieldopts)
@@ -152,12 +157,14 @@ class TendersToMySQL(object):
             chain = funcs.pop().split('.')
             parsed_schema.append((name, chain, funcs, opts[0]))
 
+        if not has_primary_key:
+            fields['pk_id'] = peewee.PrimaryKeyField(primary_key=True)
         model_class = type(name+'Model', (BaseTendersModel,), fields)
         model_class._meta.table_options = table_options
         model_class._meta.table_schema = parsed_schema
         model_class._meta.database = self.database
         model_class._meta.db_table = table_name
-        self.models[name] = model_class
+        self.models[table_name] = model_class
         if not self.client_config.get('resume', False):
             self.create_table(model_class)
 
@@ -192,6 +199,9 @@ class TendersToMySQL(object):
                         res.extend(val)
                     elif val is not None:
                         res.append(val)
+                for item in res:
+                    if isinstance(item, dict):
+                        item['parent'] = data
                 data = res
             elif data:
                 data = data.get(key)
@@ -213,6 +223,8 @@ class TendersToMySQL(object):
             value = self.field_value(chain, funcs, data)
             if value is None:
                 continue
+            if isinstance(value, list):
+                value = value[0] if len(value) else None
             if ftype == 'date':
                 value = self.parse_iso_datetime(value)
             fields[name] = value
@@ -232,7 +244,7 @@ class TendersToMySQL(object):
             root_name = table_options.get('__root__', 'root')
             if iter_list:
                 for item in iter_list:
-                    logger.info("+ Child %s %s", item.id, iter_name)
+                    logger.info("+ Child %s %s", item.get('id'), iter_name)
                     item[root_name] = data
                     self.process_model_item(model_class, item)
         else:
