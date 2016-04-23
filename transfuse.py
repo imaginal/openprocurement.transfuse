@@ -1,55 +1,71 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-import re
-import sys
+import time
 import socket
 import logging
 import logging.config
-from time import sleep
+
+from argparse import ArgumentParser
 from ConfigParser import ConfigParser
 
-import peewee
+from munch import munchify
+from iso8601 import parse_date
+from restkit.errors import ResourceError
 from openprocurement_client.client import TendersClient
+
+import simplejson as json
+import peewee
 
 logger = logging.getLogger('transfuse')
 
 
 class MyConfigParser(ConfigParser):
-    OPTCRE = re.compile(
-        r'(?P<option>[^=\s][^=]*)'
-        r'\s*(?P<vi>[=])\s*'
-        r'(?P<value>.*)$'
-        )
-    OPTCRE_NV = re.compile(
-        r'(?P<option>[^=\s][^=]*)'
-        r'\s*(?:'
-        r'(?P<vi>[=])\s*'
-        r'(?P<value>.*))?$'
-        )
     def optionxform(self, optionstr):
         return optionstr
 
 
-class MyClient(TendersClient):
-    def __init__(self, key, host_url, api_version, params=None, resource=None):
-        super(MyClient, self).__init__(key, host_url, api_version, params)
-        if resource:
-            self.prefix_path = '/api/{}/{}'.format(api_version, resource)
+class MyApiClient(TendersClient):
+    def __init__(self, key, config):
+        params = dict()
+        if config['mode'] in ('test', '_all_'):
+            params['mode'] = config['mode']
+        TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
+        if config.get('resource'):
+            self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
+        if config['timeout']:
+            socket.setdefaulttimeout(float(config['timeout']))
+
+    def get_tender(self, tender_id):
+        for i in range(5):
+            try:
+                resp = TendersClient.get_tender(self, tender_id)
+            except ResourceError as e:
+                logger.error("get_tender on %s error %s", tender_id, e)
+                time.sleep(10)
+            else:
+                return resp
+        raise ResourceError("Maximum retry reached")
+
+
+class BaseTendersModel(peewee.Model):
+    class Meta:
+        db_table = 'tenders'
 
 
 class TendersToMySQL(object):
     client_config = {
         'key': '',
         'host_url': "https://api-sandbox.openprocurement.org",
-        'api_version': '2.2',
-        'params': {},
+        'api_version': '2',
+        'mode': "_all_",
         'timeout': 30,
-        'continue': False,
-        'resource': None,
-        'skip_until': None,
-        'max_count': 0,
+        'offset': None,
+        'limit': None,
+        'resume': False,
+        'nonstop': False,
     }
-    mysql_config = {
+    server_config = {
+        'class': 'MySQLDatabase',
         'host': 'localhost',
         'user': 'tenders',
         'passwd': '',
@@ -58,146 +74,230 @@ class TendersToMySQL(object):
     }
     table_schema = {
     }
+    field_types = {
+        'char': (peewee.CharField, {'null': True, 'max_length': 250}),
+        'longchar': (peewee.CharField, {'null': True, 'max_length': 2000}),
+        'text': (peewee.TextField, {'null': True}),
+        'date': (peewee.DateTimeField, {'null': True}),
+        'int': (peewee.IntegerField, {'null': True}),
+        'bigint': (peewee.BigIntegerField, {'null': True}),
+        'float': (peewee.FloatField, {'null': True}),
+        'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 16, 'decimal_places': 2}),
+        'bool': (peewee.BooleanField, {'null': True})
+    }
 
-    class BaseTendersModel(peewee.Model):
-        class Meta:
-            db_table = 'tenders'
+    def __init__(self, config, args):
+        self.client_config.update(config.items('client'))
+        self.server_config.update(config.items('server'))
+        # update config from args
+        self.update_config(args)
+        # create client
+        api_key = self.client_config.pop('key')
+        logger.info("Create client %s", self.client_config)
+        self.client = MyApiClient(api_key, self.client_config)
+        # create database connection
+        passwd = self.server_config.pop('passwd')
+        logger.info("Connect server %s", self.server_config)
+        if passwd: self.server_config['passwd'] = passwd
+        db_class = peewee.__dict__.get(self.server_config.pop('class'))
+        self.db_name = self.server_config.pop('db')
+        self.db_table = self.server_config.pop('db_table')
+        self.database = db_class(self.db_name, **self.server_config)
+        # create model class
+        self.create_models(config)
 
-    def __init__(self, client_config, mysql_config, table_schema):
-        self.client_config.update(client_config)
-        self.mysql_config.update(mysql_config)
-        self.table_schema.update(table_schema)
-        # tenders client
-        self.timeout = float(self.client_config.pop('timeout'))
-        self.c_continue = self.client_config.pop('continue')
-        self.skip_until = self.client_config.pop('skip_until')
-        self.max_count = int(self.client_config.pop('max_count'))
-        self.client = MyClient(**self.client_config)
-        # peewee mysql
-        self.db_name = self.mysql_config.pop('db')
-        self.db_table = self.mysql_config.pop('db_table')
-        self.mysql_db = peewee.MySQLDatabase(self.db_name, **self.mysql_config)
-        self.create_model_class()
+    def update_config(self, args):
+        for key in ('offset', 'limit', 'resume'):
+            if getattr(args, key, None):
+                self.client_config[key] = getattr(args, key)
 
-    def field_name(self, key):
-        return key.replace('.', '_').replace(':', '_').lower()
+    @staticmethod
+    def field_name(name):
+        return name.replace('.', '_').replace('(', '_').replace(')', '').strip()
 
-    def filed_value(self, key, data):
-        func = None
-        if key.find(':') > 0:
-            func, key = key.split(':', 1)
-        chain = key.split('.')
+    def create_table(self, model_class):
+        logger.debug("Drop & Create table `%s`", model_class._meta.db_table)
+        try:
+            model_class.select().count()
+            model_class.drop_table()
+        except:
+            pass
+        model_class.create_table()
+
+    def init_model(self, table_name, table_schema):
+        logger.info("Create model %s", table_name)
+        fields = dict()
+        parsed_schema = list()
+        table_options = dict()
+
+        for key,val in table_schema:
+            if key.startswith('__'):
+                if key == '__iter__':
+                    val = val.split('.')
+                table_options[key] = val
+                continue
+            name = self.field_name(key)
+            logger.debug("+ %s %s", name, val)
+            opts = [s.strip() for s in val.split(',')]
+            # field = type,flags,max_length
+            fieldtype, fieldopts = self.field_types.get(opts[0])
+            if len(opts) > 1:
+                fieldopts = dict(fieldopts)
+                fieldopts[opts[1]] = True
+            if len(opts) > 2:
+                fieldopts['max_length'] = int(opts[2])
+            fields[name] = fieldtype(**fieldopts)
+            # parse field path
+            funcs = key.replace(')','').split('(')
+            chain = funcs.pop().split('.')
+            parsed_schema.append((name, chain, funcs, opts[0]))
+
+        model_class = type(name+'Model', (BaseTendersModel,), fields)
+        model_class._meta.table_options = table_options
+        model_class._meta.table_schema = parsed_schema
+        model_class._meta.database = self.database
+        model_class._meta.db_table = table_name
+        self.models[name] = model_class
+        if not self.client_config.get('resume', False):
+            self.create_table(model_class)
+
+    def create_models(self, config):
+        self.models = dict()
+        for section in config.sections():
+            if section.startswith('table:'):
+                table_schema = config.items(section)
+                table, name = section.split(':', 2)
+                self.init_model(name, table_schema)
+
+    def apply_func(self, fn, data):
+        if fn == 'count':
+            return len(data)
+        if fn == 'sum':
+            return sum(data)
+        if fn == 'min':
+            return min(data)
+        if fn == 'max':
+            return max(data)
+        if fn == 'avg':
+            return sum(data)/len(data)
+        raise ValueError('unknown function '+fn)
+
+    def field_value(self, chain, funcs, data):
         for key in chain:
             if isinstance(data, list):
                 res = list()
                 for item in data:
-                    if item.get(key):
-                        res.extend(item[key])
-                if len(res) == 1:
-                    data = res[0]
-                else:
-                    data = res
-            else:
+                    val = item.get(key)
+                    if isinstance(val, list):
+                        res.extend(val)
+                    elif val is not None:
+                        res.append(val)
+                data = res
+            elif data:
                 data = data.get(key)
-            if not data:
+            if data is None:
                 return
-        if isinstance(data, basestring) and len(data) > 999:
-            data = data[:999]
-        if func == 'count':
-            data = len(data)
+        for fn in funcs:
+            data = self.apply_func(fn, data)
         return data
 
-    def create_model_class(self):
-        fields = dict() # _id=peewee.PrimaryKeyField(primary_key=True)
-        for key,val in self.table_schema.items():
-            name = self.field_name(key)
-            fieldtype = peewee.__dict__.get(val)
-            if not fieldtype:
-                raise ValueError("Invalid filed type: %s", val)
-            fieldopts = dict(null=True)
-            if val == 'CharField' and key != 'id':
-                fieldopts['max_length'] = 1000
-            if val == 'DecimalField':
-                fieldopts['max_digits'] = 15
-                fieldopts['decimal_places'] = 2
-            if key == 'id':
-                fieldopts['primary_key'] = True
-            fields[name] = fieldtype(**fieldopts)
-        self.model_class = type('TenderModel', (self.BaseTendersModel,), fields)
-        self.model_class._meta.database = self.mysql_db
-        self.model_class._meta.db_table = self.db_table
-        # create model instance, drop and create table
-        try:
-            self.model_class.select().count()
-        except:
-            self.model_class.create_table()
+    @staticmethod
+    def parse_iso_datetime(value):
+        return parse_date(value).replace(tzinfo=None)
 
-    def process_tender(self, tender):
-        data = self.client.get_tender(tender.id)['data']
+    def process_model_item(self, model_class, data):
+        table_schema = model_class._meta.table_schema
         fields = dict()
-        for key,val in self.table_schema.items():
-            value = self.filed_value(key, data)
-            if value is not None:
-                name = self.field_name(key)
-                fields[name] = value
-        item = self.model_class(**fields)
+        for field_info in table_schema:
+            name, chain, funcs, ftype = field_info
+            value = self.field_value(chain, funcs, data)
+            if value is None:
+                continue
+            if ftype == 'date':
+                value = self.parse_iso_datetime(value)
+            fields[name] = value
+        item = model_class(**fields)
         try:
             item.save(force_insert=True)
         except peewee.IntegrityError:
-            if not getattr(item, 'id', None):
-                raise
-            logger.warning("Update %s %s", tender.id, tender.dateModified)
-            self.model_class.delete().where(
-                self.model_class.id==item.id).execute()
+            logger.warning("Delete before insert %s", data.id)
+            item.delete_instance()
             item.save(force_insert=True)
 
+    def process_model_data(self, model_class, data):
+        table_options = model_class._meta.table_options
+        if table_options.get('__iter__'):
+            iter_name = table_options['__iter__']
+            iter_list = self.field_value(iter_name, [], data)
+            root_name = table_options.get('__root__', 'root')
+            if iter_list:
+                for item in iter_list:
+                    logger.info("+ Child %s %s", item.id, iter_name)
+                    item[root_name] = data
+                    self.process_model_item(model_class, item)
+        else:
+            return self.process_model_item(model_class, data)
+
+    def process_tender(self, tender):
+        data = self.client.get_tender(tender.id)['data']
+        for model_name,model_class in self.models.items():
+            self.process_model_data(model_class, data)
+
     def run(self):
-        self.should_stop = False
-        while not self.should_stop:
-            socket.setdefaulttimeout(self.timeout)
-            tenders_list = self.client.get_tenders()
+        offset = self.client_config.get('offset', '')
+        limit = int(self.client_config.get('limit') or 0)
+        self.total_processed = 0
+
+        if offset:
+            self.client.params['offset'] = offset
+
+        while True:
+            tenders_list = self.client.get_tenders(feed='')
 
             for tender in tenders_list:
-                if self.skip_until and self.skip_until > tender.dateModified:
+                if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
-                logger.info("Process %s %s", tender.id, tender.dateModified)
+                dateModified = tender.dateModified.replace('T', ' ')[:19]
+                logger.info("Process %s %s", tender.id, dateModified)
                 self.process_tender(tender)
+                self.total_processed += 1
 
-                if self.max_count:
-                    self.max_count -= 1
-                    if self.max_count < 1:
-                        logger.info("Reached max_count, stop.")
-                        return
-            # endfor
+                if limit and self.total_processed >= limit:
+                    logger.info("Reached limit, stop.")
+                    return
 
             if not tenders_list:
-                if self.c_continue:
-                    logger.info("Wait before next loop...")
-                    sleep(10)
-                else:
-                    break
+                logger.info("No more records.")
+                break
 
-        # endwhile
+    def run_debug(self):
+        with open('debug/tender.json') as f:
+            tender = json.load(f)
+        data = munchify(tender['data'])
+        for model_name,model_class in self.models.items():
+            self.process_model_data(model_class, data)
 
 
 def main():
-    if len(sys.argv) < 2:
-        print("Usage: transfuse config.ini")
-        sys.exit(1)
+    parser = ArgumentParser(description='OpenProcurement API to SQL bridge')
+    parser.add_argument('config', nargs='+', help='ini file(s)')
+    parser.add_argument('--offset', type=int, help='client offset')
+    parser.add_argument('--limit', type=int, help='client limit')
+    parser.add_argument('--resume', action='store_true', help='dont drop table')
+    args = parser.parse_args()
 
-    logging.config.fileConfig(sys.argv[1])
+    for inifile in args.config:
+        logging.config.fileConfig(inifile)
+        break
 
-    parser = MyConfigParser(allow_no_value=True)
-    parser.read(sys.argv[1])
+    config = MyConfigParser(allow_no_value=True)
+    for inifile in args.config:
+        config.read(inifile)
 
-    client_config = parser.items('client')
-    mysql_config = parser.items('mysql')
-    table_schema = parser.items('table_schema')
-
-    app = TendersToMySQL(client_config, mysql_config, table_schema)
-    app.run()
+    app = TendersToMySQL(config, args)
+    return app.run()
 
 
 if __name__ == '__main__':

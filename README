@@ -2,4 +2,5 @@ OpenProcurement API to MySQL bridge
 
 command line tool
 
-usage: python transfuse.py tenders.ini
+usage: transfuse.py [-h] [--offset OFFSET] [--limit LIMIT] [--resume]
+                    base.ini [tender.ini lots.ini ...]

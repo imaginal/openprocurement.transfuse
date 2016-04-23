@@ -1,7 +1,6 @@
-configparser==3.5.0b2
 iso8601==0.1.11
 MySQL-python==1.2.5
-openprocurement-client==1.0a3
 peewee==2.8.0
 restkit==4.2.2
 simplejson==3.8.2
+-e git+https://github.com/openprocurement/openprocurement.client.python.git
