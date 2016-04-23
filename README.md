@@ -9,6 +9,9 @@ Can be used with databases:
 * MySQLDatabase
 * and other via peewee
 
+Usage
+----------
+
     usage: transfuse.py [-h] [--offset OFFSET] [--limit LIMIT] [--resume]
                         base.ini [tender.ini lots.ini ...]
 
