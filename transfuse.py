@@ -224,10 +224,10 @@ class TendersToMySQL(object):
         for field_info in table_schema:
             name, chain, funcs, ftype = field_info
             value = self.field_value(chain, funcs, data)
-            if value is None:
-                continue
             if isinstance(value, list):
                 value = value[0] if len(value) else None
+            if value is None:
+                continue
             if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
                 value = value[:CHAR_MAX_LENGTH]
             if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
