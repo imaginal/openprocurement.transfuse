@@ -18,6 +18,9 @@ import peewee
 
 logger = logging.getLogger('transfuse')
 
+CHAR_MAX_LENGTH = 250
+LONGCHAR_MAX_LENGTH = 1000
+
 
 class MyConfigParser(ConfigParser):
     def optionxform(self, optionstr):
@@ -74,8 +77,8 @@ class TendersToMySQL(object):
     table_schema = {
     }
     field_types = {
-        'char': (peewee.CharField, {'null': True, 'max_length': 250}),
-        'longchar': (peewee.CharField, {'null': True, 'max_length': 2500}),
+        'char': (peewee.CharField, {'null': True, 'max_length': CHAR_MAX_LENGTH}),
+        'longchar': (peewee.CharField, {'null': True, 'max_length': LONGCHAR_MAX_LENGTH}),
         'text': (peewee.TextField, {'null': True}),
         'date': (peewee.DateTimeField, {'null': True}),
         'int': (peewee.IntegerField, {'null': True}),
@@ -124,9 +127,10 @@ class TendersToMySQL(object):
         model_class.create_table()
 
     def init_model(self, table_name, table_schema):
+        logger.info("Create model %s", table_name)
         if table_name in self.models:
             raise IndexError('Model %s already exists', table_name)
-        logger.info("Create model %s", table_name)
+
         fields = dict()
         parsed_schema = list()
         table_options = dict()
@@ -224,6 +228,10 @@ class TendersToMySQL(object):
                 continue
             if isinstance(value, list):
                 value = value[0] if len(value) else None
+            if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
+                value = value[:CHAR_MAX_LENGTH]
+            if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
+                value = value[:LONGCHAR_MAX_LENGTH]
             if ftype == 'date':
                 value = self.parse_iso_datetime(value)
             fields[name] = value
@@ -294,7 +302,7 @@ class TendersToMySQL(object):
 def main():
     parser = ArgumentParser(description='OpenProcurement API to SQL bridge')
     parser.add_argument('config', nargs='+', help='ini file(s)')
-    parser.add_argument('--offset', type=int, help='client offset')
+    parser.add_argument('--offset', type=str, help='client offset')
     parser.add_argument('--limit', type=int, help='client limit')
     parser.add_argument('--resume', action='store_true', help='dont drop table')
     args = parser.parse_args()
