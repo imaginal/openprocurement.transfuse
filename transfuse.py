@@ -75,7 +75,7 @@ class TendersToMySQL(object):
     }
     field_types = {
         'char': (peewee.CharField, {'null': True, 'max_length': 250}),
-        'longchar': (peewee.CharField, {'null': True, 'max_length': 2000}),
+        'longchar': (peewee.CharField, {'null': True, 'max_length': 2500}),
         'text': (peewee.TextField, {'null': True}),
         'date': (peewee.DateTimeField, {'null': True}),
         'int': (peewee.IntegerField, {'null': True}),
@@ -115,7 +115,7 @@ class TendersToMySQL(object):
         return name.replace('.', '_').replace('(', '_').replace(')', '').strip()
 
     def create_table(self, model_class):
-        logger.debug("Drop & Create table `%s`", model_class._meta.db_table)
+        logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         try:
             model_class.select().count()
             model_class.drop_table()
