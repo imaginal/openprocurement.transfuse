@@ -145,7 +145,10 @@ class TendersToMySQL(object):
             name = self.field_name(key)
             logger.debug("+ %s %s", name, val)
             opts = [s.strip() for s in val.split(',')]
+            # [table:model_name]
             # field = type,flags,max_length
+            if opts[0] not in self.field_types:
+                raise IndexError("Wrong type name %s" % opts[0])
             fieldtype, fieldopts = self.field_types.get(opts[0])
             if len(opts) > 1:
                 fieldopts = dict(fieldopts)
@@ -190,7 +193,7 @@ class TendersToMySQL(object):
             return max(data)
         if fn == 'avg':
             return sum(data)/len(data)
-        raise ValueError('unknown function '+fn)
+        raise ValueError("Unknown function %s" % fn)
 
     def field_value(self, chain, funcs, data):
         for key in chain:
@@ -229,7 +232,7 @@ class TendersToMySQL(object):
             if value is None:
                 continue
             if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
-                value = value[:CHAR_MAX_LENGTH]
+                raise ValueError("Value of %s too long, use longchar or text" % name)
             if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
                 value = value[:LONGCHAR_MAX_LENGTH]
             if ftype == 'date':
