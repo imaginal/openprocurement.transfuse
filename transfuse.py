@@ -201,13 +201,15 @@ class TendersToMySQL(object):
                 res = list()
                 for item in data:
                     val = item.get(key)
-                    if isinstance(val, list):
-                        res.extend(val)
-                    elif val is not None:
-                        res.append(val)
-                for item in res:
-                    if isinstance(item, dict):
-                        item['parent'] = data
+                    # make val to be always a list
+                    if not isinstance(val, list):
+                        val = [val]
+                    # and solve the problem only for list
+                    for vi in val:
+                        if isinstance(vi, dict):
+                            vi['parent'] = item
+                        if vi is not None:
+                            res.append(vi)
                 data = res
             elif data:
                 data = data.get(key)
