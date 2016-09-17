@@ -370,11 +370,11 @@ class TendersToSQL(object):
 
     def save_to_cache(self, tender, data):
         if not self.cache_model:
-            return
+            return False
         json_data = json.dumps(data)
         if len(json_data) > self.cache_max_size:
-            logger.warning("Too big for cache %d", tender.id)
-            return
+            logger.warning("Too big for cache %s", tender.id)
+            return False
         cache_item = self.cache_model(tender_id=tender.id,
                 dateModified=tender.dateModified,
                 data=json_data)
@@ -382,6 +382,7 @@ class TendersToSQL(object):
             cache_item.save(force_insert=True)
         except peewee.IntegrityError:
             cache_item.save()
+        return True
 
     def run(self):
         offset = self.client_config.get('offset', '')
