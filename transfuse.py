@@ -28,6 +28,9 @@ logger = logging.getLogger('transfuse')
 CHAR_MAX_LENGTH = 250
 LONGCHAR_MAX_LENGTH = 1000
 
+DEFAULT_CONFIG = {
+    'cache': {}
+}
 
 class MyConfigParser(ConfigParser):
     def optionxform(self, optionstr):
@@ -421,7 +424,7 @@ class TendersToSQL(object):
             self.process_model_data(model_class, data)
 
 def run_app(args):
-    config = MyConfigParser(allow_no_value=True)
+    config = MyConfigParser(allow_no_value=True, defaults=DEFAULT_CONFIG)
     for inifile in args.config:
         config.test(inifile)
         config.read(inifile)
