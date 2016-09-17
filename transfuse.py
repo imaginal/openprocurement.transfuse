@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import sys
 import time
 import socket
 import logging
@@ -12,9 +13,15 @@ from munch import munchify
 from iso8601 import parse_date
 from restkit.errors import ResourceError
 from openprocurement_client.client import TendersClient
+# fix for py2exe
+from socketpool import backend_thread
+backend_thread.__dict__
+
+#from random import randint
 
 import simplejson as json
 import peewee
+
 
 logger = logging.getLogger('transfuse')
 
@@ -26,40 +33,52 @@ class MyConfigParser(ConfigParser):
     def optionxform(self, optionstr):
         return optionstr
 
+    def test(self, filename, prefix='table:'):
+        """Check config file for model duplicates"""
+        parser = ConfigParser()
+        if not parser.read(filename):
+            raise ValueError("Can't read config from file %s" % filename)
+        for section in parser.sections():
+            if section.startswith(prefix) and section in self.sections():
+                raise ValueError("Model %s duplicate in file %s" % (section, filename))
+        return True
+
 
 class MyApiClient(TendersClient):
     def __init__(self, key, config):
+        if config['timeout']:
+            socket.setdefaulttimeout(float(config['timeout']))
         params = dict()
         if config['mode'] in ('test', '_all_'):
             params['mode'] = config['mode']
         TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
         if config.get('resource'):
             self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
-        if config['timeout']:
-            socket.setdefaulttimeout(float(config['timeout']))
 
     def get_tender(self, tender_id):
         for i in range(5):
             try:
-                resp = TendersClient.get_tender(self, tender_id)
-            except ResourceError as e:
-                logger.error("get_tender on %s error %s", tender_id, e)
-                time.sleep(10)
-            else:
-                return resp
+                return TendersClient.get_tender(self, tender_id)
+            except (socket.error, ResourceError) as e:
+                logger.error("get_tender %s reason %s", tender_id, str(e))
+                time.sleep(i*10+10)
         raise ResourceError("Maximum retry reached")
 
 
 class BaseTendersModel(peewee.Model):
     class Meta:
-        db_table = 'tenders'
+        pass
+
+    @classmethod
+    def model_name(klass):
+        return klass._meta.db_table
 
 
-class TendersToMySQL(object):
+class TendersToSQL(object):
     client_config = {
-        'key': '',
-        'host_url': "https://api-sandbox.openprocurement.org",
-        'api_version': '2',
+        'key': "",
+        'host_url': "https://public.api.openprocurement.org",
+        'api_version': "0",
         'mode': "_all_",
         'timeout': 30,
         'offset': None,
@@ -68,11 +87,23 @@ class TendersToMySQL(object):
     }
     server_config = {
         'class': 'MySQLDatabase',
-        'host': 'localhost',
-        'user': 'tenders',
-        'passwd': '',
-        'db': 'tenders',
-        'db_table': 'tenders',
+    }
+    server_defaults = {
+        'MySQLDatabase': {
+            'host': 'localhost',
+            'user': 'prozorro',
+            'passwd': 'prozorro',
+            'db': 'prozorro',
+        },
+        'PostgresqlDatabase': {
+            'host': 'localhost',
+            'user': 'prozorro',
+            'password': 'prozorro',
+            'database': 'prozorro',
+        },
+        'SqliteDatabase': {
+            'db': 'prozorro.db',
+        }
     }
     table_schema = {
     }
@@ -87,23 +118,30 @@ class TendersToMySQL(object):
         'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 16, 'decimal_places': 2}),
         'bool': (peewee.BooleanField, {'null': True})
     }
+    allowed_fieldopts = ['null', 'index', 'unique', 'primary_key']
 
     def __init__(self, config, args):
-        self.client_config.update(config.items('client'))
+        db_class = config.get('server', 'class')
+        if db_class in self.server_defaults:
+            self.server_config.update(self.server_defaults[db_class])
         self.server_config.update(config.items('server'))
+        self.client_config.update(config.items('client'))
         # update config from args
         self.update_config(args)
         # create client
         api_key = self.client_config.pop('key')
         logger.info("Create client %s", self.client_config)
         self.client = MyApiClient(api_key, self.client_config)
+        # log connection config w/o password
+        safe_config = dict(self.server_config)
+        safe_config.pop('passwd', None)
+        safe_config.pop('password', None)
+        logger.info("Connect server %s", safe_config)
         # create database connection
-        passwd = self.server_config.pop('passwd')
-        logger.info("Connect server %s", self.server_config)
-        if passwd: self.server_config['passwd'] = passwd
         db_class = peewee.__dict__.get(self.server_config.pop('class'))
-        self.db_name = self.server_config.pop('db')
-        self.db_table = self.server_config.pop('db_table')
+        self.db_name = self.server_config.pop('db', None)
+        if not self.db_name and self.server_config.get('database'):
+            self.db_name = self.server_config.pop('database')
         self.database = db_class(self.db_name, **self.server_config)
         # create model class
         self.create_models(config)
@@ -112,6 +150,7 @@ class TendersToMySQL(object):
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
+        self.ignore_errors = args.ignore
 
     @staticmethod
     def field_name(name):
@@ -119,12 +158,14 @@ class TendersToMySQL(object):
 
     def create_table(self, model_class):
         logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
-        try:
-            model_class.select().count()
-            model_class.drop_table()
-        except:
-            pass
-        model_class.create_table()
+        with self.database.transaction():
+            try:
+                model_class.select().count()
+                model_class.drop_table()
+            except:
+                self.database.rollback()
+        with self.database.transaction():
+            model_class.create_table()
 
     def init_model(self, table_name, table_schema):
         logger.info("Create model %s", table_name)
@@ -133,7 +174,7 @@ class TendersToMySQL(object):
 
         fields = dict()
         parsed_schema = list()
-        table_options = dict()
+        table_options = {'__name__': table_name}
         has_primary_key = False
 
         for key,val in table_schema:
@@ -148,9 +189,11 @@ class TendersToMySQL(object):
             # [table:model_name]
             # field = type,flags,max_length
             if opts[0] not in self.field_types:
-                raise IndexError("Wrong type name %s" % opts[0])
+                raise TypeError("Unknown type '%s' for field '%s'" % (opts[0], key))
             fieldtype, fieldopts = self.field_types.get(opts[0])
             if len(opts) > 1:
+                if opts[1] not in self.allowed_fieldopts:
+                    raise ValueError("Unknown option '%s' for field '%s'" % (opts[1], key))
                 fieldopts = dict(fieldopts)
                 fieldopts[ opts[1] ] = True
                 if opts[1] == 'primary_key':
@@ -165,7 +208,8 @@ class TendersToMySQL(object):
 
         if not has_primary_key:
             fields['pk_id'] = peewee.PrimaryKeyField(primary_key=True)
-        model_class = type(name+'Model', (BaseTendersModel,), fields)
+        class_name = "%sModel" % table_name.title()
+        model_class = type(class_name, (BaseTendersModel,), fields)
         model_class._meta.table_options = table_options
         model_class._meta.table_schema = parsed_schema
         model_class._meta.database = self.database
@@ -228,25 +272,29 @@ class TendersToMySQL(object):
         fields = dict()
         for field_info in table_schema:
             name, chain, funcs, ftype = field_info
-            value = self.field_value(chain, funcs, data)
-            if isinstance(value, list):
-                value = value[0] if len(value) else None
-            if value is None:
-                continue
-            if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
-                raise ValueError("Value of %s too long, use longchar or text" % name)
-            if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
-                value = value[:LONGCHAR_MAX_LENGTH]
-            if ftype == 'date':
-                value = self.parse_iso_datetime(value)
-            fields[name] = value
+            try:
+                value = self.field_value(chain, funcs, data)
+                if isinstance(value, list):
+                    value = value[0] if len(value) else None
+                if value is None:
+                    continue
+                if ftype in ['char', 'longchar', 'text']:
+                    value = unicode(value)
+                if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
+                    raise ValueError("Value too long, use longchar or text")
+                if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
+                    value = value[:LONGCHAR_MAX_LENGTH]
+                if ftype == 'date':
+                    value = self.parse_iso_datetime(value)
+                fields[name] = value
+                #if randint(1,1000) < 2:
+                #    raise ValueError("*** TEST *** ERROR ***")
+            except Exception as e:
+                message = "%s on model [%s] field %s itemID:%s" % (str(e),
+                    str(model_class.model_name()), name, data.get('id'))
+                raise type(e), type(e)(message), sys.exc_info()[2]
         item = model_class(**fields)
-        try:
-            item.save(force_insert=True)
-        except peewee.IntegrityError:
-            logger.warning("Delete before insert %s", data.id)
-            item.delete_instance()
-            item.save(force_insert=True)
+        item.save(force_insert=True)
 
     def process_model_data(self, model_class, data):
         table_options = model_class._meta.table_options
@@ -264,8 +312,17 @@ class TendersToMySQL(object):
 
     def process_tender(self, tender):
         data = self.client.get_tender(tender.id)['data']
-        for model_name,model_class in self.models.items():
-            self.process_model_data(model_class, data)
+        with self.database.transaction():
+            try:
+                for model_name,model_class in self.models.items():
+                    self.process_model_data(model_class, data)
+            except Exception as e:
+                message = str(e) + " rootID:%s" % data.get('id')
+                if self.ignore_errors:
+                    self.database.rollback()
+                    logger.error(message)
+                    return
+                raise type(e), type(e)(message), sys.exc_info()[2]
 
     def run(self):
         offset = self.client_config.get('offset', '')
@@ -303,26 +360,47 @@ class TendersToMySQL(object):
         for model_name,model_class in self.models.items():
             self.process_model_data(model_class, data)
 
+def run_app(args):
+    config = MyConfigParser(allow_no_value=True)
+    for inifile in args.config:
+        config.test(inifile)
+        config.read(inifile)
+
+    app = TendersToSQL(config, args)
+    return app.run()
 
 def main():
-    parser = ArgumentParser(description='OpenProcurement API to SQL bridge')
+    description = "Prozorro to SQL server bridge, v0.3"
+    parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
-    parser.add_argument('--offset', type=str, help='client offset')
-    parser.add_argument('--limit', type=int, help='client limit')
-    parser.add_argument('--resume', action='store_true', help='dont drop table')
+    parser.add_argument('-o', '--offset', type=str, help='client api offset')
+    parser.add_argument('-l', '--limit', type=int, help='client api limit')
+    parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
+    parser.add_argument('-i', '--ignore', action='store_true', help='ignore errors')
+    parser.add_argument('-d', '--debug', action='store_true', help='print traceback')
+    parser.add_argument('-p', '--pause', action='store_true', help='pause before exit')
     args = parser.parse_args()
 
     for inifile in args.config:
         logging.config.fileConfig(inifile)
         break
 
-    config = MyConfigParser(allow_no_value=True)
-    for inifile in args.config:
-        config.read(inifile)
+    if args.debug:
+        logger.setLevel(logging.DEBUG)
 
-    app = TendersToMySQL(config, args)
-    return app.run()
+    logger.info(description)
 
+    try:
+        run_app(args)
+    except Exception as e:
+        if args.debug:
+            logger.exception("Got Exception")
+        else:
+            logger.error(e)
+
+    if args.pause:
+        print "Press Enter to continue..."
+        raw_input()
 
 if __name__ == '__main__':
     main()
