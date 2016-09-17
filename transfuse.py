@@ -74,6 +74,12 @@ class BaseTendersModel(peewee.Model):
         return klass._meta.db_table
 
 
+class CacheTendersModel(BaseTendersModel):
+    tender_id = peewee.CharField(primary_key=True)
+    dateModified = peewee.CharField()
+    data = peewee.TextField()
+
+
 class TendersToSQL(object):
     client_config = {
         'key': "",
@@ -84,9 +90,12 @@ class TendersToSQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
+        'no-cache': False,
     }
     server_config = {
         'class': 'MySQLDatabase',
+    }
+    cache_config = {
     }
     server_defaults = {
         'MySQLDatabase': {
@@ -126,6 +135,7 @@ class TendersToSQL(object):
             self.server_config.update(self.server_defaults[db_class])
         self.server_config.update(config.items('server'))
         self.client_config.update(config.items('client'))
+        self.cache_config.update(config.items('cache', vars={}))
         # update config from args
         self.update_config(args)
         # create client
@@ -145,12 +155,32 @@ class TendersToSQL(object):
         self.database = db_class(self.db_name, **self.server_config)
         # create model class
         self.create_models(config)
+        # create cache model
+        self.init_cache()
 
     def update_config(self, args):
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
+        if args.no_cache:
+            self.cache_config = {}
         self.ignore_errors = args.ignore
+
+    def init_cache(self):
+        cache_table = self.cache_config.get('table')
+        if not cache_table:
+            self.cache_model = None
+            return
+        logger.info("Init cache table `%s`", cache_table)
+        self.cache_model = CacheTendersModel
+        self.cache_model._meta.database = self.database
+        self.cache_model._meta.db_table = cache_table
+        self.cache_max_size = 0xffff
+        try:
+            self.cache_model.select().count()
+        except:
+            self.database.rollback()
+            self.cache_model.create_table()
 
     @staticmethod
     def field_name(name):
@@ -311,7 +341,10 @@ class TendersToSQL(object):
             return self.process_model_item(model_class, data)
 
     def process_tender(self, tender):
-        data = self.client.get_tender(tender.id)['data']
+        data = self.get_from_cache(tender)
+        if not data:
+            data = self.client.get_tender(tender.id)['data']
+            self.save_to_cache(tender, data)
         with self.database.transaction():
             try:
                 for model_name,model_class in self.models.items():
@@ -323,6 +356,32 @@ class TendersToSQL(object):
                     logger.error(message)
                     return
                 raise type(e), type(e)(message), sys.exc_info()[2]
+
+    def get_from_cache(self, tender):
+        if not self.cache_model:
+            return None
+        try:
+            item = self.cache_model.get(
+                self.cache_model.tender_id == tender.id,
+                self.cache_model.dateModified == tender.dateModified)
+        except self.cache_model.DoesNotExist:
+            return None
+        return munchify(json.loads(item.data))
+
+    def save_to_cache(self, tender, data):
+        if not self.cache_model:
+            return
+        json_data = json.dumps(data)
+        if len(json_data) > self.cache_max_size:
+            logger.warning("Too big for cache %d", tender.id)
+            return
+        cache_item = self.cache_model(tender_id=tender.id,
+                dateModified=tender.dateModified,
+                data=json_data)
+        try:
+            cache_item.save(force_insert=True)
+        except peewee.IntegrityError:
+            cache_item.save()
 
     def run(self):
         offset = self.client_config.get('offset', '')
@@ -370,13 +429,14 @@ def run_app(args):
     return app.run()
 
 def main():
-    description = "Prozorro to SQL server bridge, v0.3"
+    description = "Prozorro API to SQL server bridge, v0.3"
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
     parser.add_argument('-i', '--ignore', action='store_true', help='ignore errors')
+    parser.add_argument('-n', '--no-cache', action='store_true', help="don't use cache")
     parser.add_argument('-d', '--debug', action='store_true', help='print traceback')
     parser.add_argument('-p', '--pause', action='store_true', help='pause before exit')
     args = parser.parse_args()
