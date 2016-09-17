@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 import sys
 import time
+import zlib
 import socket
 import logging
 import logging.config
@@ -76,7 +77,7 @@ class BaseTendersModel(peewee.Model):
 class CacheTendersModel(BaseTendersModel):
     tender_id = peewee.CharField(primary_key=True)
     dateModified = peewee.CharField()
-    data = peewee.TextField()
+    gzip_data = peewee.BlobField()
 
 
 class TendersToSQL(object):
@@ -157,11 +158,14 @@ class TendersToSQL(object):
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
-        self.no_cache = args.no_cache
+        self.conf_clear_cache = args.clear_cache
+        self.conf_no_cache = args.no_cache
         self.ignore_errors = args.ignore
 
     def init_cache(self, config):
         self.cache_model = None
+        if self.conf_no_cache:
+            return
         if not config.has_option('cache', 'table'):
             return
         cache_table = config.get('cache', 'table')
@@ -177,6 +181,9 @@ class TendersToSQL(object):
         except:
             self.database.rollback()
             self.cache_model.create_table()
+        if self.conf_clear_cache:
+            logger.warning("Clear cache table `%s`", cache_table)
+            self.cache_model.delete().execute()
 
     @staticmethod
     def field_name(name):
@@ -362,18 +369,18 @@ class TendersToSQL(object):
                 self.cache_model.dateModified == tender.dateModified)
         except self.cache_model.DoesNotExist:
             return None
-        return munchify(json.loads(item.data))
+        return munchify(json.loads(zlib.decompress(item.gzip_data)))
 
     def save_to_cache(self, tender, data):
         if not self.cache_model:
             return False
-        json_data = json.dumps(data)
-        if len(json_data) > self.cache_max_size:
+        gzip_data = zlib.compress(json.dumps(data))
+        if len(gzip_data) > self.cache_max_size:
             logger.warning("Too big for cache %s", tender.id)
             return False
         cache_item = self.cache_model(tender_id=tender.id,
                 dateModified=tender.dateModified,
-                data=json_data)
+                gzip_data=gzip_data)
         try:
             cache_item.save(force_insert=True)
         except peewee.IntegrityError:
@@ -433,6 +440,7 @@ def main():
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
     parser.add_argument('-i', '--ignore', action='store_true', help='ignore errors')
+    parser.add_argument('-c', '--clear-cache', action='store_true', help="clear cache")
     parser.add_argument('-n', '--no-cache', action='store_true', help="don't use cache")
     parser.add_argument('-d', '--debug', action='store_true', help='print traceback')
     parser.add_argument('-p', '--pause', action='store_true', help='pause before exit')
