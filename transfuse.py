@@ -7,7 +7,7 @@ import logging
 import logging.config
 
 from argparse import ArgumentParser
-from ConfigParser import ConfigParser
+from ConfigParser import RawConfigParser
 
 from munch import munchify
 from iso8601 import parse_date
@@ -28,17 +28,13 @@ logger = logging.getLogger('transfuse')
 CHAR_MAX_LENGTH = 250
 LONGCHAR_MAX_LENGTH = 1000
 
-DEFAULT_CONFIG = {
-    'cache': {}
-}
-
-class MyConfigParser(ConfigParser):
+class MyConfigParser(RawConfigParser):
     def optionxform(self, optionstr):
         return optionstr
 
     def test(self, filename, prefix='table:'):
         """Check config file for model duplicates"""
-        parser = ConfigParser()
+        parser = MyConfigParser()
         if not parser.read(filename):
             raise ValueError("Can't read config from file %s" % filename)
         for section in parser.sections():
@@ -93,12 +89,9 @@ class TendersToSQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
-        'no-cache': False,
     }
     server_config = {
         'class': 'MySQLDatabase',
-    }
-    cache_config = {
     }
     server_defaults = {
         'MySQLDatabase': {
@@ -138,7 +131,6 @@ class TendersToSQL(object):
             self.server_config.update(self.server_defaults[db_class])
         self.server_config.update(config.items('server'))
         self.client_config.update(config.items('client'))
-        self.cache_config.update(config.items('cache', vars={}))
         # update config from args
         self.update_config(args)
         # create client
@@ -159,20 +151,21 @@ class TendersToSQL(object):
         # create model class
         self.create_models(config)
         # create cache model
-        self.init_cache()
+        self.init_cache(config)
 
     def update_config(self, args):
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
-        if args.no_cache:
-            self.cache_config = {}
+        self.no_cache = args.no_cache
         self.ignore_errors = args.ignore
 
-    def init_cache(self):
-        cache_table = self.cache_config.get('table')
+    def init_cache(self, config):
+        self.cache_model = None
+        if not config.has_option('cache', 'table'):
+            return
+        cache_table = config.get('cache', 'table')
         if not cache_table:
-            self.cache_model = None
             return
         logger.info("Init cache table `%s`", cache_table)
         self.cache_model = CacheTendersModel
@@ -424,7 +417,7 @@ class TendersToSQL(object):
             self.process_model_data(model_class, data)
 
 def run_app(args):
-    config = MyConfigParser(allow_no_value=True, defaults=DEFAULT_CONFIG)
+    config = MyConfigParser(allow_no_value=True)
     for inifile in args.config:
         config.test(inifile)
         config.read(inifile)
