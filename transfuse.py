@@ -213,6 +213,7 @@ class TendersToSQL(object):
         for key,val in table_schema:
             if key.startswith('__'):
                 if key == '__iter__':
+                    table_options['__path__'] = val
                     val = val.split('.')
                 table_options[key] = val
                 continue
@@ -333,11 +334,12 @@ class TendersToSQL(object):
         table_options = model_class._meta.table_options
         if table_options.get('__iter__'):
             iter_name = table_options['__iter__']
+            iter_path = table_options['__path__']
             iter_list = self.field_value(iter_name, [], data)
             root_name = table_options.get('__root__', 'root')
             if iter_list:
                 for item in iter_list:
-                    logger.info("+ Child %s %s", item.get('id'), iter_name)
+                    logger.info("+ Child %s %s", item.get('id', '-'), iter_path)
                     item[root_name] = data
                     self.process_model_item(model_class, item)
         else:
