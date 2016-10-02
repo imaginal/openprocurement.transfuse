@@ -52,6 +52,7 @@ class MyApiClient(TendersClient):
         TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
         if config.get('resource'):
             self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
+        self.allow_preload = config.get('preload', None)
 
     def preload_tenders(self, feed='', callback=None):
         preload_items = []
@@ -60,6 +61,8 @@ class MyApiClient(TendersClient):
             items = self.get_tenders(feed=feed)
             if items:
                 preload_items.extend(items)
+            if not self.allow_preload:
+                break
             if items and callback:
                 callback(len(preload_items), items[-1])
         return preload_items
@@ -102,6 +105,7 @@ class TendersToSQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
+        'preload': False,
     }
     server_config = {
         'class': 'MySQLDatabase',
