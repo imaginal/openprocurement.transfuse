@@ -6,6 +6,8 @@ import zlib
 import socket
 import logging
 import logging.config
+import simplejson as json
+import peewee
 
 from argparse import ArgumentParser
 from ConfigParser import RawConfigParser
@@ -18,16 +20,12 @@ from openprocurement_client.client import TendersClient
 from socketpool import backend_thread
 backend_thread.__dict__
 
-#from random import randint
-
-import simplejson as json
-import peewee
-
 
 logger = logging.getLogger('transfuse')
 
 CHAR_MAX_LENGTH = 250
 LONGCHAR_MAX_LENGTH = 1000
+
 
 class MyConfigParser(RawConfigParser):
     def optionxform(self, optionstr):
@@ -46,14 +44,25 @@ class MyConfigParser(RawConfigParser):
 
 class MyApiClient(TendersClient):
     def __init__(self, key, config):
-        if config['timeout']:
-            socket.setdefaulttimeout(float(config['timeout']))
-        params = dict()
+        params = {'limit': 1000}
         if config['mode'] in ('test', '_all_'):
             params['mode'] = config['mode']
+        if config['timeout']:
+            socket.setdefaulttimeout(float(config['timeout']))
         TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
         if config.get('resource'):
             self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
+
+    def preload_tenders(self, feed='', callback=None):
+        preload_items = []
+        items = True
+        while items:
+            items = self.get_tenders(feed=feed)
+            if items:
+                preload_items.extend(items)
+            if items and callback:
+                callback(len(preload_items), items[-1])
+        return preload_items
 
     def get_tender(self, tender_id):
         for i in range(5):
@@ -61,7 +70,10 @@ class MyApiClient(TendersClient):
                 return TendersClient.get_tender(self, tender_id)
             except (socket.error, ResourceError) as e:
                 logger.error("get_tender %s reason %s", tender_id, str(e))
-                time.sleep(i*10+10)
+                if i > 2:
+                    self.headers.pop('Cookie', None)
+                    self.params.pop('offset', None)
+                time.sleep(10 * i + 10)
         raise ResourceError("Maximum retry reached")
 
 
@@ -158,13 +170,13 @@ class TendersToSQL(object):
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
-        self.conf_clear_cache = args.clear_cache
-        self.conf_no_cache = args.no_cache
+        for key in ('no_cache', 'drop_cache', 'fill_cache'):
+            setattr(self, key, getattr(args, key, False))
         self.ignore_errors = args.ignore
 
     def init_cache(self, config):
         self.cache_model = None
-        if self.conf_no_cache:
+        if self.no_cache:
             return
         if not config.has_option('cache', 'table'):
             return
@@ -175,15 +187,20 @@ class TendersToSQL(object):
         self.cache_model = CacheTendersModel
         self.cache_model._meta.database = self.database
         self.cache_model._meta.db_table = cache_table
-        self.cache_max_size = 0xffff
+        self.cache_max_size = 0xfff0
         try:
-            self.cache_model.select().count()
+            self.cache_model.select().limit(1).execute()
+            cache_table_exists = True
         except:
+            cache_table_exists = False
             self.database.rollback()
+        if self.drop_cache and cache_table_exists:
+            logger.warning("Drop cache table `%s`", cache_table)
+            self.cache_model.drop_table()
+            cache_table_exists = False
+        if not cache_table_exists:
+            logger.info("Create cache table `%s`", cache_table)
             self.cache_model.create_table()
-        if self.conf_clear_cache:
-            logger.warning("Clear cache table `%s`", cache_table)
-            self.cache_model.delete().execute()
 
     @staticmethod
     def field_name(name):
@@ -193,7 +210,7 @@ class TendersToSQL(object):
         logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         with self.database.transaction():
             try:
-                model_class.select().count()
+                model_class.select().limit(1).execute()
                 model_class.drop_table()
             except:
                 self.database.rollback()
@@ -210,7 +227,7 @@ class TendersToSQL(object):
         table_options = {'__name__': table_name}
         has_primary_key = False
 
-        for key,val in table_schema:
+        for key, val in table_schema:
             if key.startswith('__'):
                 if key == '__iter__':
                     table_options['__path__'] = val
@@ -236,7 +253,7 @@ class TendersToSQL(object):
                 fieldopts['max_length'] = int(opts[2])
             fields[name] = fieldtype(**fieldopts)
             # parse field path
-            funcs = key.replace(')','').split('(')
+            funcs = key.replace(')', '').split('(')
             chain = funcs.pop().split('.')
             parsed_schema.append((name, chain, funcs, opts[0]))
 
@@ -270,7 +287,7 @@ class TendersToSQL(object):
         if fn == 'max':
             return max(data)
         if fn == 'avg':
-            return sum(data)/len(data)
+            return sum(data) / len(data)
         raise ValueError("Unknown function %s" % fn)
 
     def field_value(self, chain, funcs, data):
@@ -321,8 +338,6 @@ class TendersToSQL(object):
                 if ftype == 'date':
                     value = self.parse_iso_datetime(value)
                 fields[name] = value
-                #if randint(1,1000) < 2:
-                #    raise ValueError("*** TEST *** ERROR ***")
             except Exception as e:
                 message = "%s on model [%s] field %s itemID:%s" % (str(e),
                     str(model_class.model_name()), name, data.get('id'))
@@ -350,9 +365,11 @@ class TendersToSQL(object):
         if not data:
             data = self.client.get_tender(tender.id)['data']
             self.save_to_cache(tender, data)
+        if self.fill_cache:
+            return
         with self.database.transaction():
             try:
-                for model_name,model_class in self.models.items():
+                for model_name, model_class in self.models.items():
                     self.process_model_data(model_class, data)
             except Exception as e:
                 message = str(e) + " rootID:%s" % data.get('id')
@@ -389,6 +406,9 @@ class TendersToSQL(object):
             cache_item.save()
         return True
 
+    def onpreload(self, count, last):
+        logger.info("Preload %d last %s", count, last['dateModified'])
+
     def run(self):
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
@@ -398,7 +418,7 @@ class TendersToSQL(object):
             self.client.params['offset'] = offset
 
         while True:
-            tenders_list = self.client.get_tenders(feed='')
+            tenders_list = self.client.preload_tenders(callback=self.onpreload)
 
             for tender in tenders_list:
                 if offset and offset > tender.dateModified:
@@ -422,8 +442,9 @@ class TendersToSQL(object):
         with open('debug/tender.json') as f:
             tender = json.load(f)
         data = munchify(tender['data'])
-        for model_name,model_class in self.models.items():
+        for model_name, model_class in self.models.items():
             self.process_model_data(model_class, data)
+
 
 def run_app(args):
     config = MyConfigParser(allow_no_value=True)
@@ -434,6 +455,7 @@ def run_app(args):
     app = TendersToSQL(config, args)
     return app.run()
 
+
 def main():
     description = "Prozorro API to SQL server bridge, v0.3"
     parser = ArgumentParser(description=description)
@@ -442,7 +464,8 @@ def main():
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
     parser.add_argument('-i', '--ignore', action='store_true', help='ignore errors')
-    parser.add_argument('-c', '--clear-cache', action='store_true', help="clear cache")
+    parser.add_argument('-x', '--drop-cache', action='store_true', help="clear cache")
+    parser.add_argument('-f', '--fill-cache', action='store_true', help="only save to cache")
     parser.add_argument('-n', '--no-cache', action='store_true', help="don't use cache")
     parser.add_argument('-d', '--debug', action='store_true', help='print traceback')
     parser.add_argument('-p', '--pause', action='store_true', help='pause before exit')
