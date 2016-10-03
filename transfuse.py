@@ -53,10 +53,16 @@ class MyApiClient(TendersClient):
         if config.get('resource'):
             self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
         self.allow_preload = config.get('preload', None)
+        self.api_version = config['api_version']
+
+    def request_cookie(self):
+        self.head('/api/{}/spore'.format(self.api_version))
 
     def preload_tenders(self, feed='', callback=None):
         preload_items = []
         items = True
+        if not self.headers.get('Cookie', None):
+            self.request_cookie()
         while items:
             items = self.get_tenders(feed=feed)
             if items:
@@ -70,10 +76,12 @@ class MyApiClient(TendersClient):
     def get_tender(self, tender_id):
         for i in range(5):
             try:
+                if not self.headers.get('Cookie', None):
+                    self.request_cookie()
                 return TendersClient.get_tender(self, tender_id)
             except (socket.error, ResourceError) as e:
                 logger.error("get_tender %s reason %s", tender_id, str(e))
-                if i > 2:
+                if i > 1:
                     self.headers.pop('Cookie', None)
                     self.params.pop('offset', None)
                 time.sleep(10 * i + 10)
