@@ -18,7 +18,7 @@ from restkit.errors import ResourceError
 from openprocurement_client.client import TendersClient
 # fix for py2exe
 from socketpool import backend_thread
-backend_thread.__all__
+backend_thread.__dict__
 
 
 logger = logging.getLogger('transfuse')
