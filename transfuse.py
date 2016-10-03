@@ -18,7 +18,7 @@ from restkit.errors import ResourceError
 from openprocurement_client.client import TendersClient
 # fix for py2exe
 from socketpool import backend_thread
-backend_thread.__dict__
+backend_thread.__all__
 
 
 logger = logging.getLogger('transfuse')
@@ -83,7 +83,7 @@ class MyApiClient(TendersClient):
                 logger.error("get_tender %s reason %s", tender_id, str(e))
                 if i > 1:
                     self.headers.pop('Cookie', None)
-                    self.params.pop('offset', None)
+                    #self.params.pop('offset', None)
                 time.sleep(10 * i + 10)
         raise ResourceError("Maximum retry reached")
 
@@ -494,6 +494,9 @@ def main():
 
     try:
         run_app(args)
+    except KeyboardInterrupt:
+        logger.error("Keyboard Interrupt")
+        pass
     except Exception as e:
         if args.debug:
             logger.exception("Got Exception")
