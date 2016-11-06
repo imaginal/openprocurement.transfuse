@@ -169,10 +169,13 @@ class TendersToSQL(object):
         logger.info("Connect server %s", safe_config)
         # create database connection
         db_class = peewee.__dict__.get(self.server_config.pop('class'))
+        self.db_init = self.server_config.pop('init', '').strip(' \'"')
         self.db_name = self.server_config.pop('db', None)
         if not self.db_name and self.server_config.get('database'):
             self.db_name = self.server_config.pop('database')
         self.database = db_class(self.db_name, **self.server_config)
+        if self.db_init:
+            self.database.execute_sql(self.db_init)
         # create model class
         self.create_models(config)
         # create cache model
@@ -469,7 +472,7 @@ def run_app(args):
 
 
 def main():
-    description = "Prozorro API to SQL server bridge, v0.3"
+    description = "Prozorro API to SQL server bridge, v0.4"
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
@@ -490,7 +493,7 @@ def main():
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
-    logger.info(description)
+    exit_code = 0
 
     try:
         run_app(args)
@@ -502,10 +505,14 @@ def main():
             logger.exception("Got Exception")
         else:
             logger.error(e)
+        exit_code = 1
 
     if args.pause:
         print "Press Enter to continue..."
         raw_input()
 
+    return exit_code
+
+
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
