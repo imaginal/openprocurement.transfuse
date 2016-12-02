@@ -204,7 +204,7 @@ class TendersToSQL(object):
         self.cache_model._meta.db_table = cache_table
         self.cache_max_size = 0xfff0
         try:
-            self.cache_model.select().limit(1).execute()
+            self.cache_model.select().count()
             cache_table_exists = True
         except:
             cache_table_exists = False
