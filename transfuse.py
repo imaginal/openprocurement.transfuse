@@ -225,7 +225,7 @@ class TendersToSQL(object):
         logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         with self.database.transaction():
             try:
-                model_class.select().limit(1).execute()
+                model_class.select().count()
                 model_class.drop_table()
             except:
                 self.database.rollback()
