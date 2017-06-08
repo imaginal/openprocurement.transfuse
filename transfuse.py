@@ -14,6 +14,8 @@ from ConfigParser import RawConfigParser
 
 from munch import munchify
 from iso8601 import parse_date
+from retrying import retry
+from restkit import Resource
 from restkit.errors import ResourceError
 from openprocurement_client.client import TendersClient
 # fix for py2exe
@@ -42,7 +44,34 @@ class MyConfigParser(RawConfigParser):
         return True
 
 
-class MyApiClient(TendersClient):
+class DozorroClient(Resource):
+    def __init__(self, key, config, **kwargs):
+        Resource.__init__(self, config['host_url'], **kwargs)
+        self.headers = {"Content-Type": "application/json"}
+        self.prefix = '/api/v1/data'
+        self.params = {}
+
+    def update_params(self, params):
+        self.params.update(params)
+
+    @retry(stop_max_attempt_number=5)
+    def get_items(self):
+        response = self.get(self.prefix, params_dict=self.params)
+        if response.status_int == 200:
+            data = json.loads(response.body_string())
+            if 'next_page' in data:
+                self.update_params(data['next_page'])
+            return data['data']
+
+    @retry(stop_max_attempt_number=5)
+    def get_data(self, data):
+        response = self.get('{}/{}'.format(self.prefix, data['id']))
+        if response.status_int == 200:
+            data = json.loads(response.body_string())
+            return data['data']
+
+
+class ProzorroClient(TendersClient):
     def __init__(self, key, config):
         params = {'limit': 1000}
         if config['mode'] in ('test', '_all_'):
@@ -83,9 +112,13 @@ class MyApiClient(TendersClient):
                 logger.error("get_tender %s reason %s", tender_id, str(e))
                 if i > 1:
                     self.headers.pop('Cookie', None)
-                    #self.params.pop('offset', None)
+                    # self.params.pop('offset', None)
                 time.sleep(10 * i + 10)
         raise ResourceError("Maximum retry reached")
+
+
+class MyApiClient(DozorroClient):
+    pass
 
 
 class BaseTendersModel(peewee.Model):
@@ -159,7 +192,7 @@ class TendersToSQL(object):
         # update config from args
         self.update_config(args)
         # create client
-        api_key = self.client_config.pop('key')
+        api_key = self.client_config.pop('key', '')
         logger.info("Create client %s", self.client_config)
         self.client = MyApiClient(api_key, self.client_config)
         # log connection config w/o password
@@ -218,7 +251,10 @@ class TendersToSQL(object):
             self.cache_model.create_table()
 
     @staticmethod
-    def field_name(name):
+    def field_name(name, trim=[]):
+        for tr in trim:
+            if name.startswith(tr):
+                name = name.replace(tr + '.', '')
         return name.replace('.', '_').replace('(', '_').replace(')', '').strip()
 
     def create_table(self, model_class):
@@ -239,7 +275,7 @@ class TendersToSQL(object):
 
         fields = dict()
         parsed_schema = list()
-        table_options = {'__name__': table_name}
+        table_options = {'__name__': table_name, '__trim__': []}
         has_primary_key = False
 
         for key, val in table_schema:
@@ -247,9 +283,11 @@ class TendersToSQL(object):
                 if key == '__iter__':
                     table_options['__path__'] = val
                     val = val.split('.')
+                if key == '__trim__':
+                    val = val.split(',')
                 table_options[key] = val
                 continue
-            name = self.field_name(key)
+            name = self.field_name(key, table_options['__trim__'])
             logger.debug("+ %s %s", name, val)
             opts = [s.strip() for s in val.split(',')]
             # [table:model_name]
@@ -333,7 +371,28 @@ class TendersToSQL(object):
     def parse_iso_datetime(value):
         return parse_date(value).replace(tzinfo=None)
 
+    def dump_item(self, model_class, fields, data):
+        table_options = model_class._meta.table_options
+        root_name = table_options.get('__root__', 'root')
+        root_fields = {}
+        for key, value in fields.items():
+            if key.startswith(root_name):
+                root_fields[key] = value
+        for key, value in data.items():
+            if isinstance(value, list) and len(value):
+                if isinstance(value[0], dict):
+                    continue
+                value = ','.join(map(unicode, value))
+            if isinstance(value, dict):
+                continue
+            if value is None:
+                continue
+            value = unicode(value)[:CHAR_MAX_LENGTH]
+            item = model_class(key=key, value=value, **root_fields)
+            item.save(force_insert=True)
+
     def process_model_item(self, model_class, data):
+        table_options = model_class._meta.table_options
         table_schema = model_class._meta.table_schema
         fields = dict()
         for field_info in table_schema:
@@ -357,6 +416,9 @@ class TendersToSQL(object):
                 message = "%s on model [%s] field %s itemID:%s" % (str(e),
                     str(model_class.model_name()), name, data.get('id'))
                 raise type(e), type(e)(message), sys.exc_info()[2]
+        # DOZORRO ################################################
+        if table_options.get('__dump__', False):
+            return self.dump_item(model_class, fields, data)
         item = model_class(**fields)
         item.save(force_insert=True)
 
@@ -368,6 +430,8 @@ class TendersToSQL(object):
             iter_list = self.field_value(iter_name, [], data)
             root_name = table_options.get('__root__', 'root')
             if iter_list:
+                if isinstance(iter_list, dict):
+                    iter_list = [iter_list]
                 for item in iter_list:
                     logger.info("+ Child %s %s", item.get('id', '-'), iter_path)
                     item[root_name] = data
@@ -460,6 +524,49 @@ class TendersToSQL(object):
         for model_name, model_class in self.models.items():
             self.process_model_data(model_class, data)
 
+    # DOZORRO ####################################################
+
+    def process_dozorro_form_item(self, data):
+        with self.database.transaction():
+            try:
+                for model_name, model_class in self.models.items():
+                    self.process_model_data(model_class, data)
+            except Exception as e:
+                message = str(e) + " rootID:%s" % data.get('id')
+                if self.ignore_errors:
+                    self.database.rollback()
+                    logger.error(message)
+                    return
+                raise type(e), type(e)(message), sys.exc_info()[2]
+
+    def process_dozorro_form_data(self, data):
+        items_list = self.client.get_data(data)
+        for data in items_list:
+            if data['envelope']['model'] not in ('form', 'comment'):
+                logger.info("-- Skip %s %s", data['id'], data['envelope']['model'])
+                continue
+            logger.info("Process %s %s", data['id'], data['envelope']['date'])
+            self.process_dozorro_form_item(data)
+
+    def run_dozorro(self):
+        limit = int(self.client_config.get('limit') or 0)
+        self.total_processed = 0
+
+        while True:
+            forms_list = self.client.get_items()
+
+            for form in forms_list:
+                self.process_dozorro_form_data(form)
+                self.total_processed += 1
+
+                if limit and self.total_processed >= limit:
+                    logger.info("Reached limit, stop.")
+                    return
+
+            if not forms_list:
+                logger.info("No more records.")
+                break
+
 
 def run_app(args):
     config = MyConfigParser(allow_no_value=True)
@@ -468,7 +575,7 @@ def run_app(args):
         config.read(inifile)
 
     app = TendersToSQL(config, args)
-    return app.run()
+    return app.run_dozorro()
 
 
 def main():
