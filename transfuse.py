@@ -44,7 +44,7 @@ class MyConfigParser(RawConfigParser):
 
 class MyApiClient(TendersClient):
     def __init__(self, key, config):
-        params = {'limit': 1000}
+        params = {'limit': 1000, 'mode': ''}
         if config['mode'] in ('test', '_all_'):
             params['mode'] = config['mode']
         if config['timeout']:
@@ -52,8 +52,20 @@ class MyApiClient(TendersClient):
         TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
         if config.get('resource'):
             self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
-        self.allow_preload = config.get('preload', None)
+        self.allow_preload = self.bool_value(config.get('preload', False))
         self.api_version = config['api_version']
+
+    @staticmethod
+    def bool_value(value):
+        try:
+            return int(value or 0)
+        except ValueError:
+            value = value.strip().lower()
+        if value in ('yes', 'on', 'true'):
+            return True
+        if value in ('no', 'off', 'false'):
+            return False
+        raise ValueError('bad bool value')
 
     def request_cookie(self):
         self.head('/api/{}/spore'.format(self.api_version))
@@ -83,7 +95,6 @@ class MyApiClient(TendersClient):
                 logger.error("get_tender %s reason %s", tender_id, str(e))
                 if i > 1:
                     self.headers.pop('Cookie', None)
-                    #self.params.pop('offset', None)
                 time.sleep(10 * i + 10)
         raise ResourceError("Maximum retry reached")
 
@@ -145,7 +156,7 @@ class TendersToSQL(object):
         'int': (peewee.IntegerField, {'null': True}),
         'bigint': (peewee.BigIntegerField, {'null': True}),
         'float': (peewee.FloatField, {'null': True}),
-        'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 16, 'decimal_places': 2}),
+        'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 20, 'decimal_places': 2}),
         'bool': (peewee.BooleanField, {'null': True})
     }
     allowed_fieldopts = ['null', 'index', 'unique', 'primary_key']
@@ -171,6 +182,7 @@ class TendersToSQL(object):
         db_class = peewee.__dict__.get(self.server_config.pop('class'))
         self.db_init = self.server_config.pop('init', '').strip(' \'"')
         self.db_name = self.server_config.pop('db', None)
+        self.db_ping = self.server_config.pop('ping', 0)
         if not self.db_name and self.server_config.get('database'):
             self.db_name = self.server_config.pop('database')
         self.database = db_class(self.db_name, **self.server_config)
@@ -203,10 +215,14 @@ class TendersToSQL(object):
         self.cache_model._meta.database = self.database
         self.cache_model._meta.db_table = cache_table
         self.cache_max_size = 0xfff0
+        self.cache_hit_count = 0
+        self.cache_miss_count = 0
         try:
-            self.cache_model.select().count()
+            self.cache_model.select().get()
             cache_table_exists = True
-        except:
+        except CacheTendersModel.DoesNotExist:
+            cache_table_exists = True
+        except peewee.DatabaseError:
             cache_table_exists = False
             self.database.rollback()
         if self.drop_cache and cache_table_exists:
@@ -225,9 +241,8 @@ class TendersToSQL(object):
         logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         with self.database.transaction():
             try:
-                model_class.select().count()
-                model_class.drop_table()
-            except:
+                model_class.drop_table(fail_silently=True)
+            except peewee.DatabaseError:
                 self.database.rollback()
         with self.database.transaction():
             model_class.create_table()
@@ -376,6 +391,8 @@ class TendersToSQL(object):
             return self.process_model_item(model_class, data)
 
     def process_tender(self, tender):
+        if self.db_ping:
+            self.ping_db_connection()
         data = self.get_from_cache(tender)
         if not data:
             data = self.client.get_tender(tender.id)['data']
@@ -394,15 +411,27 @@ class TendersToSQL(object):
                     return
                 raise type(e), type(e)(message), sys.exc_info()[2]
 
+    def ping_db_connection(self):
+        conn = self.database.get_conn()
+        if hasattr(conn, 'ping'):
+            conn.ping(True)
+
     def get_from_cache(self, tender):
         if not self.cache_model:
             return None
+        total_count = self.cache_hit_count + self.cache_miss_count
+        if total_count > 0 and total_count % 1000 == 0:
+            usage = 100.0 * self.cache_hit_count / total_count
+            logger.info("-- Cache hit %d miss %d usage %1.0f %%",
+                self.cache_hit_count, self.cache_miss_count, usage)
         try:
             item = self.cache_model.get(
                 self.cache_model.tender_id == tender.id,
                 self.cache_model.dateModified == tender.dateModified)
         except self.cache_model.DoesNotExist:
+            self.cache_miss_count += 1
             return None
+        self.cache_hit_count += 1
         return munchify(json.loads(zlib.decompress(item.gzip_data)))
 
     def save_to_cache(self, tender, data):
