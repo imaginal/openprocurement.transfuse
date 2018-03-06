@@ -480,7 +480,7 @@ class TendersToSQL(object):
             logger.debug("Delete child %s %d rows", table_options['__path__'], deleted)
         else:
             deleted = model_class.delete().where(model_class.id == tender.id).execute()
-            logger.debug("Delete parent %s %d row", model_class.model_name(), deleted)
+            logger.debug("Delete root %s %d row", model_class.model_name(), deleted)
 
     def tender_exists(self, tender, delete=False):
         try:
@@ -532,7 +532,7 @@ class TendersToSQL(object):
         total_count = self.cache_hit_count + self.cache_miss_count
         if total_count > 0 and total_count % 1000 == 0:
             usage = 100.0 * self.cache_hit_count / total_count
-            logger.info("-- Cache hit %d miss %d usage %1.0f %%",
+            logger.info("= Cache hit %d miss %d usage %1.0f %%",
                 self.cache_hit_count, self.cache_miss_count, usage)
         try:
             item = self.cache_model.get(
