@@ -201,6 +201,10 @@ class TendersToSQL(object):
         'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 20, 'decimal_places': 2}),
         'bool': (peewee.BooleanField, {'null': True})
     }
+    field_overrides = {
+        'primary_key': 'int',
+        'bool': 'tinyint',
+    }
     allowed_fieldopts = ['null', 'index', 'unique', 'primary_key']
 
     def __init__(self, config, args):
@@ -279,10 +283,33 @@ class TendersToSQL(object):
     def field_name(name):
         return name.replace('.', '_').replace('(', '_').replace(')', '').strip()
 
+    def compare_table(self, table_name, fields):
+        compiler = self.database.compiler()
+        columns = self.database.get_columns(table_name)
+        col_map = {c.name: c for c in columns}
+        for col in columns:
+            if col.name not in fields:
+                raise KeyError("Table %s filed %s not found in config" % (table_name, col.name))
+        for name in fields.keys():
+            if name not in col_map:
+                raise KeyError("Table %s filed %s not found in database" % (table_name, name))
+            data_type = col_map[name].data_type
+            db_field = fields[name].db_field
+            if data_type == db_field:
+                continue
+            if data_type == compiler.get_column_type(db_field).lower():
+                continue
+            if data_type == self.field_overrides.get(db_field, ''):
+                continue
+            raise TypeError("Table %s filed %s type not euqal, re-create tables" % (table_name, name))
+
+        logger.info("Use existing table `%s`", table_name)
+
     def create_table(self, model_class):
         logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         with self.database.transaction():
             try:
+                model_class.select().count()
                 model_class.drop_table(fail_silently=True)
             except peewee.DatabaseError:
                 self.database.rollback()
@@ -338,16 +365,28 @@ class TendersToSQL(object):
         model_class._meta.database = self.database
         model_class._meta.db_table = table_name
         self.models[table_name] = model_class
-        if not self.client_config.get('resume', False):
+        if self.client_config['resume']:
+            self.compare_table(table_name, fields)
+        else:
             self.create_table(model_class)
+        # check for main model
+        if 'dateModified' in fields and '__iter__' not in table_options:
+            self.main_model = model_class
 
     def create_models(self, config):
         self.models = dict()
+        self.main_model = None
         for section in config.sections():
             if section.startswith('table:'):
                 table_schema = config.items(section)
                 table, name = section.split(':', 2)
                 self.init_model(name, table_schema)
+
+        self.sorted_models = sorted(self.models.values(),
+            key=lambda m: len(m._meta.table_options.get('__iter__', [])))
+
+        if self.client_config['resume'] and not self.main_model:
+            raise ValueError('Main model is required for resume mode')
 
     def apply_func(self, fn, data):
         if fn == 'count':
@@ -432,9 +471,38 @@ class TendersToSQL(object):
         else:
             return self.process_model_item(model_class, data)
 
+    def delete_model_data(self, model_class, tender):
+        table_options = model_class._meta.table_options
+        if table_options.get('__iter__'):
+            root_name = table_options.get('__root__', 'root')
+            root_id = getattr(model_class, '%s_id' % root_name)
+            deleted = model_class.delete().where(root_id == tender.id).execute()
+            logger.debug("Delete child %s %d rows", table_options['__path__'], deleted)
+        else:
+            deleted = model_class.delete().where(model_class.id == tender.id).execute()
+            logger.debug("Delete parent %s %d row", model_class.model_name(), deleted)
+
+    def tender_exists(self, tender, delete=False):
+        try:
+            found = self.main_model.get(self.main_model.id == tender.id)
+            if found.dateModified == tender.dateModified:
+                return True
+        except self.main_model.DoesNotExist:
+            return None
+
+        if found and delete:
+            logger.debug("Delete %s %s", found.id, found.dateModified)
+            with self.database.transaction():
+                for model_class in reversed(self.sorted_models):
+                    self.delete_model_data(model_class, tender)
+
     def process_tender(self, tender):
         if self.db_ping:
             self.ping_db_connection()
+        if self.client_config['resume'] and self.tender_exists(tender, delete=True):
+            logger.debug("Exists %s %s", tender.id, tender.dateModified)
+            return
+        logger.info("Process %s %s", tender.id, tender.dateModified)
         data = self.get_from_cache(tender)
         if not data:
             data = self.client.get_tender(tender.id)['data']
@@ -443,7 +511,7 @@ class TendersToSQL(object):
             return
         with self.database.transaction():
             try:
-                for model_name, model_class in self.models.items():
+                for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
             except Exception as e:
                 message = str(e) + " rootID:%s" % data.get('id')
@@ -512,8 +580,6 @@ class TendersToSQL(object):
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
-                dateModified = tender.dateModified.replace('T', ' ')[:19]
-                logger.info("Process %s %s", tender.id, dateModified)
                 self.process_tender(tender)
                 self.total_processed += 1
 
@@ -529,7 +595,7 @@ class TendersToSQL(object):
         with open('debug/tender.json') as f:
             tender = json.load(f)
         data = munchify(tender['data'])
-        for model_name, model_class in self.models.items():
+        for model_class in self.sorted_models:
             self.process_model_data(model_class, data)
 
 
