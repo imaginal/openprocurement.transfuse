@@ -14,8 +14,8 @@ from ConfigParser import RawConfigParser
 
 from munch import munchify
 from iso8601 import parse_date
-from restkit.errors import ResourceError
-from openprocurement_client.client import TendersClient
+from restkit.errors import ResourceError, ResourceNotFound
+from openprocurement_client.client import APIBaseClient
 # fix for py2exe
 from socketpool import backend_thread
 backend_thread.__dict__
@@ -42,18 +42,21 @@ class MyConfigParser(RawConfigParser):
         return True
 
 
-class MyApiClient(TendersClient):
+class MyApiClient(APIBaseClient):
     def __init__(self, key, config):
         params = {'limit': 1000, 'mode': ''}
         if config['mode'] in ('test', '_all_'):
             params['mode'] = config['mode']
-        if config['timeout']:
-            socket.setdefaulttimeout(float(config['timeout']))
-        TendersClient.__init__(self, key, config['host_url'], config['api_version'], params)
-        if config.get('resource'):
-            self.prefix_path = '/api/{}/{}'.format(config['api_version'], config['resource'])
+        timeout = float(config.get('timeout', 0))
+        if timeout > 0.01:
+            socket.setdefaulttimeout(timeout)
+        APIBaseClient.__init__(
+            self, key, config['host_url'], config['api_version'], config['resource'], params,
+            timeout=timeout)
+        self.headers['User-Agent'] = "Transfuse/2.0 %s" % self.headers.get('User-Agent', '')
         self.allow_preload = self.bool_value(config.get('preload', False))
         self.api_version = config['api_version']
+        self.log_cookie()
 
     @staticmethod
     def bool_value(value):
@@ -67,8 +70,12 @@ class MyApiClient(TendersClient):
             return False
         raise ValueError('bad bool value')
 
+    def log_cookie(self):
+        logger.info("Cookie: %s", self.headers.get('Cookie'))
+
     def request_cookie(self):
         self.head('/api/{}/spore'.format(self.api_version))
+        self.log_cookie()
 
     def preload_tenders(self, feed='', callback=None):
         preload_items = []
@@ -85,17 +92,50 @@ class MyApiClient(TendersClient):
                 callback(len(preload_items), items[-1])
         return preload_items
 
+    def log_request_error(self, msg, e=''):
+        logger.error("%s error %s", msg, str(e))
+        logger.error("Request params %s headers %s", self.params, self.headers)
+        if e and getattr(e, 'response', None):
+            logger.error("Response status %s headers %s", e.response.status_int, e.response.headers)
+
+    def get_tenders(self, params={}, feed='changes'):
+        params['feed'] = feed
+        for i in range(5):
+            try:
+                self._update_params(params)
+                response = self.get(
+                    self.prefix_path,
+                    params_dict=self.params)
+                if response.status_int == 200:
+                    tender_list = munchify(json.loads(response.body_string()))
+                    self._update_params(tender_list.next_page)
+                    return tender_list.data
+
+                logger.warning("get_tenders response %d headers %s",
+                    response.status_int, str(response.headers))
+
+            except ResourceNotFound:
+                self.params.pop('offset', '')
+                raise
+            except (socket.error, ResourceError) as e:
+                self.log_request_error('get_tenders', e)
+                time.sleep(10 * i + 10)
+
+        raise ResourceError("Maximum retry reached")
+
     def get_tender(self, tender_id):
         for i in range(5):
             try:
                 if not self.headers.get('Cookie', None):
                     self.request_cookie()
-                return TendersClient.get_tender(self, tender_id)
+                return self._get_resource_item('{}/{}'.format(self.prefix_path, tender_id))
+
             except (socket.error, ResourceError) as e:
-                logger.error("get_tender %s reason %s", tender_id, str(e))
+                self.log_request_error('get_tender/%s' % tender_id, e)
                 if i > 1:
                     self.headers.pop('Cookie', None)
                 time.sleep(10 * i + 10)
+
         raise ResourceError("Maximum retry reached")
 
 
@@ -119,12 +159,14 @@ class TendersToSQL(object):
         'key': "",
         'host_url': "https://public.api.openprocurement.org",
         'api_version': "0",
+        'resource': "tenders",
         'mode': "_all_",
-        'timeout': 30,
+        'feed': "",
         'offset': None,
         'limit': None,
         'resume': False,
         'preload': False,
+        'timeout': 30,
     }
     server_config = {
         'class': 'MySQLDatabase',
@@ -451,9 +493,10 @@ class TendersToSQL(object):
         return True
 
     def onpreload(self, count, last):
-        logger.info("Preload %d last %s", count, last['dateModified'])
+        logger.info("Preload %d last %s offs %s", count, last.get('dateModified', ''), self.client.params['offset'])
 
     def run(self):
+        feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
         self.total_processed = 0
@@ -462,7 +505,7 @@ class TendersToSQL(object):
             self.client.params['offset'] = offset
 
         while True:
-            tenders_list = self.client.preload_tenders(callback=self.onpreload)
+            tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
 
             for tender in tenders_list:
                 if offset and offset > tender.dateModified:
