@@ -519,7 +519,7 @@ class TendersToSQL(object):
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
             except Exception as e:
-                message = str(e) + " rootID:%s" % data.get('id')
+                message = str(e) + " root:%s" % data.get('id')
                 if self.ignore_errors:
                     self.database.rollback()
                     logger.error(message)
