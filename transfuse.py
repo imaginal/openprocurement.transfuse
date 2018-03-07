@@ -14,12 +14,15 @@ from ConfigParser import RawConfigParser
 
 from munch import munchify
 from iso8601 import parse_date
+from datetime import datetime
 from restkit.errors import ResourceError, ResourceNotFound
 from openprocurement_client.client import APIBaseClient
 # fix for py2exe
 from socketpool import backend_thread
 backend_thread.__dict__
 
+
+__version__ = '2.0.1'
 
 logger = logging.getLogger('transfuse')
 
@@ -53,7 +56,7 @@ class MyApiClient(APIBaseClient):
         APIBaseClient.__init__(
             self, key, config['host_url'], config['api_version'], config['resource'], params,
             timeout=timeout)
-        self.headers['User-Agent'] = "Transfuse/2.0 %s" % self.headers.get('User-Agent', '')
+        self.headers['User-Agent'] = "Transfuse/%s %s" % (__version__, config['user_agent'])
         self.allow_preload = self.bool_value(config.get('preload', False))
         self.api_version = config['api_version']
         self.log_cookie()
@@ -160,6 +163,7 @@ class TendersToSQL(object):
         'host_url': "https://public.api.openprocurement.org",
         'api_version': "0",
         'resource': "tenders",
+        'user_agent': '',
         'mode': "_all_",
         'feed': "",
         'offset': None,
@@ -195,6 +199,7 @@ class TendersToSQL(object):
         'longchar': (peewee.CharField, {'null': True, 'max_length': LONGCHAR_MAX_LENGTH}),
         'text': (peewee.TextField, {'null': True}),
         'date': (peewee.DateTimeField, {'null': True}),
+        'now': (peewee.DateTimeField, {'default': datetime.now}),
         'int': (peewee.IntegerField, {'null': True}),
         'bigint': (peewee.BigIntegerField, {'null': True}),
         'float': (peewee.FloatField, {'null': True}),
@@ -610,7 +615,7 @@ def run_app(args):
 
 
 def main():
-    description = "Prozorro API to SQL server bridge, v0.4"
+    description = "Prozorro API to SQL server bridge, v%s" % __version__
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
