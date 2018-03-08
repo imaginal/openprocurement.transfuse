@@ -164,7 +164,7 @@ class TendersToSQL(object):
         'api_version': "0",
         'resource': "tenders",
         'user_agent': '',
-        'mode': "_all_",
+        'mode': "",
         'feed': "",
         'offset': None,
         'limit': None,
