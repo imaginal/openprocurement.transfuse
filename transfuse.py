@@ -17,12 +17,18 @@ from iso8601 import parse_date
 from datetime import datetime
 from restkit.errors import ResourceError, ResourceNotFound
 from openprocurement_client.client import APIBaseClient
+
+# NOTE: Hold a reference to Queue.Empty so at shutdown time it continues
+# being defined. Otherwise it's garbage collected and the daemon threads
+# may raise exceptions when Empty is equal to None at process termination.
+import Queue
+unused_Empty = Queue.Empty
 # fix for py2exe
 from socketpool import backend_thread
-backend_thread.__dict__
+unused_Queue = backend_thread.PriorityQueue
 
 
-__version__ = '2.0.1'
+__version__ = '2.0.2'
 
 logger = logging.getLogger('transfuse')
 
