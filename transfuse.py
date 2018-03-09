@@ -388,11 +388,11 @@ class TendersToSQL(object):
         for key, val in index_schema:
             index_fields = []
             unique = False
+            if val.startswith('unique:'):
+                val = val.replace('unique:', '')
+                unique = True
             for name in val.split(','):
                 name = self.field_name(name)
-                if name == 'unique':
-                    unique = True
-                    continue
                 if name not in fields:
                     raise IndexError('Model %s index %s field %s not found' % (table_name, key, name))
                 index_fields.append(name)
