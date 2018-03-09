@@ -609,7 +609,6 @@ class TendersToSQL(object):
         self.total_deleted = 0
         self.total_inserted = 0
         last_date = ''
-
         if offset:
             self.client.params['offset'] = offset
 
@@ -622,8 +621,8 @@ class TendersToSQL(object):
             for tender in tenders_list:
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
-                    logger.info("Total processed %d deleted %d inserted %s last %s",
-                                self.total_processed, self.total_inserted, self.total_deleted, last_date)
+                    logger.info("Total %d del %d ins %s last %s", self.total_processed,
+                                self.total_inserted, self.total_deleted, last_date)
 
                 if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
