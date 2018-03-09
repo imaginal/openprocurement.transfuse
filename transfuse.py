@@ -28,7 +28,7 @@ from socketpool import backend_thread
 unused_Queue = backend_thread.PriorityQueue
 
 
-__version__ = '2.0.2'
+__version__ = '2.1.0'
 
 logger = logging.getLogger('transfuse')
 
@@ -163,6 +163,11 @@ class CacheTendersModel(BaseTendersModel):
     gzip_data = peewee.BlobField()
 
 
+def avg(data):
+    if data:
+        return sum(data) / len(data)
+
+
 class TendersToSQL(object):
     client_config = {
         'key': "",
@@ -215,6 +220,13 @@ class TendersToSQL(object):
     field_overrides = {
         'primary_key': 'int',
         'bool': 'tinyint',
+    }
+    known_funcs = {
+        'count': len,
+        'sum': sum,
+        'min': min,
+        'max': max,
+        'avg': avg,
     }
     allowed_fieldopts = ['null', 'index', 'unique', 'primary_key']
 
@@ -327,14 +339,15 @@ class TendersToSQL(object):
         with self.database.transaction():
             model_class.create_table()
 
-    def init_model(self, table_name, table_schema):
+    def init_model(self, table_name, table_schema, index_schema):
         logger.info("Create model %s", table_name)
         if table_name in self.models:
-            raise IndexError('Model %s already exists', table_name)
+            raise IndexError('Model %s already exists' % table_name)
 
         fields = dict()
         parsed_schema = list()
         table_options = {'__name__': table_name}
+        index_options = []
         has_primary_key = False
 
         for key, val in table_schema:
@@ -345,6 +358,8 @@ class TendersToSQL(object):
                 table_options[key] = val
                 continue
             name = self.field_name(key)
+            if name in fields:
+                raise IndexError('Model %s field %s already exists' % (table_name, name))
             logger.debug("+ %s %s", name, val)
             opts = [s.strip() for s in val.split(',')]
             # [table:model_name]
@@ -365,12 +380,30 @@ class TendersToSQL(object):
             # parse field path
             funcs = key.replace(')', '').split('(')
             chain = funcs.pop().split('.')
+            for f in funcs:
+                if f not in self.known_funcs:
+                    raise IndexError("Unknown function '%s' in field '%s'" % (f, key))
             parsed_schema.append((name, chain, funcs, opts[0]))
+
+        for key, val in index_schema:
+            index_fields = []
+            unique = False
+            for name in val.split(','):
+                name = self.field_name(name)
+                if name == 'unique':
+                    unique = True
+                    continue
+                if name not in fields:
+                    raise IndexError('Model %s index %s field %s not found' % (table_name, key, name))
+                index_fields.append(name)
+            logger.debug("+ INDEX %s ON %s %s", key, index_fields, unique)
+            index_options.append((key, index_fields, unique))
 
         if not has_primary_key:
             fields['pk_id'] = peewee.PrimaryKeyField(primary_key=True)
         class_name = "%sModel" % table_name.title()
         model_class = type(class_name, (BaseTendersModel,), fields)
+        model_class._meta.index_options = index_options
         model_class._meta.table_options = table_options
         model_class._meta.table_schema = parsed_schema
         model_class._meta.database = self.database
@@ -391,7 +424,11 @@ class TendersToSQL(object):
             if section.startswith('table:'):
                 table_schema = config.items(section)
                 table, name = section.split(':', 2)
-                self.init_model(name, table_schema)
+                index_section = 'index:' + name
+                index_schema = []
+                if config.has_section(index_section):
+                    index_schema = config.items(index_section)
+                self.init_model(name, table_schema, index_schema)
 
         self.sorted_models = sorted(self.models.values(),
             key=lambda m: len(m._meta.table_options.get('__iter__', [])))
@@ -399,18 +436,18 @@ class TendersToSQL(object):
         if self.client_config['resume'] and not self.main_model:
             raise ValueError('Main model is required for resume mode')
 
+    def create_indexes(self):
+        for model_class in self.sorted_models:
+            index_options = model_class._meta.index_options
+            for name, fields, unique in index_options:
+                unique_str = 'UNIQUE ' if unique else ''
+                logger.info("CREATE %sINDEX %s ON %s (%s);", unique_str, name,
+                    model_class.model_name(), ', '.join(fields))
+                with self.database.transaction():
+                    self.database.create_index(model_class, fields, unique)
+
     def apply_func(self, fn, data):
-        if fn == 'count':
-            return len(data)
-        if fn == 'sum':
-            return sum(data)
-        if fn == 'min':
-            return min(data)
-        if fn == 'max':
-            return max(data)
-        if fn == 'avg':
-            return sum(data) / len(data)
-        raise ValueError("Unknown function %s" % fn)
+        return self.known_funcs[fn](data)
 
     def field_value(self, chain, funcs, data):
         for key in chain:
@@ -596,11 +633,14 @@ class TendersToSQL(object):
 
                 if limit and self.total_processed >= limit:
                     logger.info("Reached limit, stop.")
-                    return
+                    break
 
             if not tenders_list:
                 logger.info("No more records.")
                 break
+
+        if not self.client_config['resume']:
+            self.create_indexes()
 
     def run_debug(self):
         with open('debug/tender.json') as f:
@@ -621,7 +661,7 @@ def run_app(args):
 
 
 def main():
-    description = "Prozorro API to SQL server bridge, v%s" % __version__
+    description = "Prozorro API to SQL server bridge v%s" % __version__
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
