@@ -618,7 +618,7 @@ class TendersToSQL(object):
             for tender in tenders_list:
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
-                    logger.info("Last dateModified %s", last_date)
+                    logger.info("Total processed %d last dateModified %s", total_processed, last_date)
 
                 if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
