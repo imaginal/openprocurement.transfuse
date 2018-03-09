@@ -486,7 +486,7 @@ class TendersToSQL(object):
                     value = self.parse_iso_datetime(value)
                 fields[name] = value
             except Exception as e:
-                message = "%s on model [%s] field %s itemID:%s" % (str(e),
+                message = "%s on model [%s] field %s itemID=%s" % (str(e),
                     str(model_class.model_name()), name, data.get('id'))
                 raise type(e), type(e)(message), sys.exc_info()[2]
         item = model_class(**fields)
@@ -552,7 +552,7 @@ class TendersToSQL(object):
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
             except Exception as e:
-                message = str(e) + " root:%s" % data.get('id')
+                message = str(e) + " rootID=%s" % data.get('id')
                 if self.ignore_errors:
                     self.database.rollback()
                     logger.error(message)
