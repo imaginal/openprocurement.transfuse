@@ -599,15 +599,15 @@ class TendersToSQL(object):
         return True
 
     def onpreload(self, count, last):
-        logger.info("Preload %d last %s offs %s", count, last.get('dateModified', ''), self.client.params['offset'])
+        logger.info("Preload %d last %s", count, last.get('dateModified', ''))
 
     def run(self):
         feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
+        self.total_processed = 0
         self.total_deleted = 0
         self.total_inserted = 0
-        self.total_processed = 0
         last_date = ''
 
         if offset:
