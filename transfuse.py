@@ -678,6 +678,8 @@ def main():
     if args.debug:
         logger.setLevel(logging.DEBUG)
 
+    logger.info(description)
+
     exit_code = 0
 
     try:
@@ -695,6 +697,8 @@ def main():
     if args.pause:
         print "Press Enter to continue..."
         raw_input()
+
+    logger.info("Exit with code %d", exit_code)
 
     return exit_code
 
