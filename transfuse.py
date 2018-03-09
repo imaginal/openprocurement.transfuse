@@ -528,6 +528,7 @@ class TendersToSQL(object):
 
         if found and delete:
             logger.debug("Delete %s %s", found.id, found.dateModified)
+            self.total_deleted += 1
             with self.database.transaction():
                 for model_class in reversed(self.sorted_models):
                     self.delete_model_data(model_class, tender)
@@ -547,6 +548,7 @@ class TendersToSQL(object):
             return
         with self.database.transaction():
             try:
+                self.total_inserted += 1
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
             except Exception as e:
@@ -568,7 +570,7 @@ class TendersToSQL(object):
         total_count = self.cache_hit_count + self.cache_miss_count
         if total_count > 0 and total_count % 1000 == 0:
             usage = 100.0 * self.cache_hit_count / total_count
-            logger.info("= Cache hit %d miss %d usage %1.0f %%",
+            logger.info("Cache hit %d miss %d usage %1.0f %%",
                 self.cache_hit_count, self.cache_miss_count, usage)
         try:
             item = self.cache_model.get(
@@ -603,7 +605,9 @@ class TendersToSQL(object):
         feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
-        total_processed = 0
+        self.total_deleted = 0
+        self.total_inserted = 0
+        self.total_processed = 0
         last_date = ''
 
         if offset:
@@ -618,16 +622,17 @@ class TendersToSQL(object):
             for tender in tenders_list:
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
-                    logger.info("Total processed %d last dateModified %s", total_processed, last_date)
+                    logger.info("Total processed %d deleted %d inserted %s last %s",
+                                self.total_processed, self.total_inserted, self.total_deleted, last_date)
 
                 if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
                 self.process_tender(tender)
-                total_processed += 1
+                self.total_processed += 1
 
-                if limit and total_processed >= limit:
+                if limit and self.total_processed >= limit:
                     logger.info("Reached limit, stop.")
                     break
 
