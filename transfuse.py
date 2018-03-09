@@ -28,7 +28,7 @@ from socketpool import backend_thread
 unused_Queue = backend_thread.PriorityQueue
 
 
-__version__ = '2.1.0'
+__version__ = '2.1.1'
 
 logger = logging.getLogger('transfuse')
 
@@ -63,21 +63,9 @@ class MyApiClient(APIBaseClient):
             self, key, config['host_url'], config['api_version'], config['resource'], params,
             timeout=timeout)
         self.headers['User-Agent'] = "Transfuse/%s %s" % (__version__, config['user_agent'])
-        self.allow_preload = self.bool_value(config.get('preload', False))
+        self.limit_preload = int(config.get('preload', 0))
         self.api_version = config['api_version']
         self.log_cookie()
-
-    @staticmethod
-    def bool_value(value):
-        try:
-            return int(value or 0)
-        except ValueError:
-            value = value.strip().lower()
-        if value in ('yes', 'on', 'true'):
-            return True
-        if value in ('no', 'off', 'false'):
-            return False
-        raise ValueError('bad bool value')
 
     def log_cookie(self):
         logger.info("Cookie: %s", self.headers.get('Cookie'))
@@ -86,7 +74,7 @@ class MyApiClient(APIBaseClient):
         self.head('/api/{}/spore'.format(self.api_version))
         self.log_cookie()
 
-    def preload_tenders(self, feed='', callback=None):
+    def preload_tenders(self, feed='', limit=0, callback=None):
         preload_items = []
         items = True
         if not self.headers.get('Cookie', None):
@@ -95,7 +83,7 @@ class MyApiClient(APIBaseClient):
             items = self.get_tenders(feed=feed)
             if items:
                 preload_items.extend(items)
-            if not self.allow_preload:
+            if self.limit_preload >= 0 and self.limit_preload < len(preload_items):
                 break
             if items and callback:
                 callback(len(preload_items), items[-1])
@@ -180,7 +168,7 @@ class TendersToSQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
-        'preload': False,
+        'preload': 0,
         'timeout': 30,
     }
     server_config = {
@@ -619,6 +607,9 @@ class TendersToSQL(object):
 
         if offset:
             self.client.params['offset'] = offset
+
+        if limit and self.client.limit_preload > limit:
+            self.client.limit_preload = limit
 
         while True:
             tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
