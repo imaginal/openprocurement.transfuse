@@ -549,7 +549,6 @@ class TendersToSQL(object):
             return
         with self.database.transaction():
             try:
-                self.total_inserted += 1
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
             except Exception as e:
@@ -609,7 +608,6 @@ class TendersToSQL(object):
         self.total_listed = 0
         self.total_processed = 0
         self.total_deleted = 0
-        self.total_inserted = 0
         last_date = ''
         if offset:
             self.client.params['offset'] = offset
@@ -624,8 +622,8 @@ class TendersToSQL(object):
                 self.total_listed += 1
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
-                    insert_new = self.total_inserted - self.total_deleted
-                    logger.info("Total %d processed %s new %d upd %s last %s", self.total_listed,
+                    insert_new = self.total_processed - self.total_deleted
+                    logger.info("Total %d processed %d new %d upd %s last %s", self.total_listed,
                                 self.total_processed, insert_new, self.total_deleted, last_date)
 
                 if offset and offset > tender.dateModified:
@@ -636,11 +634,12 @@ class TendersToSQL(object):
                 self.total_processed += 1
 
                 if limit and self.total_processed >= limit:
-                    logger.info("Reached limit, stop.")
+                    logger.info("Reached limit %d records, stop.", limit)
                     break
 
             if not tenders_list:
-                logger.info("No more records.")
+                logger.info("Total %d processed %d. No more records.", self.total_listed,
+                            self.total_processed)
                 break
 
         if not self.client_config['resume']:
