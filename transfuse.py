@@ -606,6 +606,7 @@ class TendersToSQL(object):
         feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
+        self.total_listed = 0
         self.total_processed = 0
         self.total_deleted = 0
         self.total_inserted = 0
@@ -620,10 +621,12 @@ class TendersToSQL(object):
             tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
 
             for tender in tenders_list:
+                self.total_listed += 1
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
-                    logger.info("Total %d del %d ins %s last %s", self.total_processed,
-                                self.total_inserted, self.total_deleted, last_date)
+                    insert_new = self.total_inserted - self.total_deleted
+                    logger.info("Total %d processed %s new %d upd %s last %s", self.total_listed,
+                                self.total_processed, insert_new, self.total_deleted, last_date)
 
                 if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
