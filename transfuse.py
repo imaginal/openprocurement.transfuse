@@ -260,7 +260,7 @@ class TendersToSQL(object):
 
     def init_cache(self, config):
         self.cache_model = None
-        if self.no_cache:
+        if self.no_cache or self.client_config['resume']:
             return
         if not config.has_option('cache', 'table'):
             return
