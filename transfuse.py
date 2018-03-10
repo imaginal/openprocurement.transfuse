@@ -623,7 +623,7 @@ class TendersToSQL(object):
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
                     insert_new = self.total_processed - self.total_deleted
-                    logger.info("Total %d processed %d new %d upd %s last %s", self.total_listed,
+                    logger.info("Total %d processed %d new %d upd %d last %s", self.total_listed,
                                 self.total_processed, insert_new, self.total_deleted, last_date)
 
                 if offset and offset > tender.dateModified:
