@@ -619,12 +619,13 @@ class TendersToSQL(object):
             tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
 
             for tender in tenders_list:
-                self.total_listed += 1
                 if last_date < tender.dateModified[:10]:
                     last_date = tender.dateModified[:10]
                     insert_new = self.total_processed - self.total_deleted
                     logger.info("Total %d processed %d new %d upd %d last %s", self.total_listed,
                                 self.total_processed, insert_new, self.total_deleted, last_date)
+
+                self.total_listed += 1
 
                 if offset and offset > tender.dateModified:
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
