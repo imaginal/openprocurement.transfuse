@@ -520,7 +520,8 @@ class TendersToSQL(object):
 
     def tender_exists(self, tender, delete=False):
         try:
-            found = self.main_model.select(self.main_model.id).get(self.main_model.id == tender.id)
+            found = self.main_model.select(self.main_model.id).where(
+                self.main_model.id == tender.id).get()
             if found.dateModified == tender.dateModified:
                 return True
         except self.main_model.DoesNotExist:
