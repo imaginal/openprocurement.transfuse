@@ -552,6 +552,7 @@ class TendersToSQL(object):
             try:
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
+                self.total_inserted += 1
             except Exception as e:
                 message = str(e) + " rootID=%s" % data.get('id')
                 if self.ignore_errors:
@@ -608,6 +609,7 @@ class TendersToSQL(object):
         limit = int(self.client_config.get('limit') or 0)
         self.total_listed = 0
         self.total_processed = 0
+        self.total_inserted = 0
         self.total_deleted = 0
         last_date = ''
         last_total = 0
@@ -625,7 +627,7 @@ class TendersToSQL(object):
                 if last_date < tender.dateModified[:10] or self.total_listed - last_total > 10000:
                     last_date = tender.dateModified[:10]
                     last_total = self.total_listed
-                    insert_new = self.total_processed - self.total_deleted
+                    insert_new = self.total_inserted - self.total_deleted
                     logger.info("Total %d processed %d new %d upd %d last %s", self.total_listed,
                                 self.total_processed, insert_new, self.total_deleted, last_date)
 
