@@ -603,6 +603,12 @@ class TendersToSQL(object):
     def onpreload(self, count, last):
         logger.info("Preload %d last %s", count, last.get('dateModified', ''))
 
+    def log_total(self, last_date):
+        insert_new = self.total_inserted - self.total_deleted
+        ignored = self.total_listed - self.total_processed
+        logger.info("Total %d ignore %d new %d upd %d last %s", self.total_listed,
+                    ignored, insert_new, self.total_deleted, last_date)
+
     def run(self):
         feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
@@ -620,16 +626,20 @@ class TendersToSQL(object):
         if limit and self.client.limit_preload > limit:
             self.client.limit_preload = limit
 
-        while True:
+        tenders_list = True
+
+        while tenders_list:
             tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
 
+            if not tenders_list:
+                logger.info("No more records.")
+                break
+
             for tender in tenders_list:
-                if last_date < tender.dateModified[:10] or self.total_listed - last_total > 10000:
+                if last_date < tender.dateModified[:10] or self.total_listed - last_total >= 10000:
                     last_date = tender.dateModified[:10]
                     last_total = self.total_listed
-                    insert_new = self.total_inserted - self.total_deleted
-                    logger.info("Total %d processed %d new %d upd %d last %s", self.total_listed,
-                                self.total_processed, insert_new, self.total_deleted, last_date)
+                    self.log_total(last_date)
 
                 self.total_listed += 1
 
@@ -642,12 +652,10 @@ class TendersToSQL(object):
 
                 if limit and self.total_processed >= limit:
                     logger.info("Reached limit %d records, stop.", limit)
+                    tenders_list = False
                     break
 
-            if not tenders_list:
-                logger.info("Total %d processed %d. No more records.", self.total_listed,
-                            self.total_processed)
-                break
+        self.log_total(last_date)
 
         if not self.client_config['resume']:
             self.create_indexes()
