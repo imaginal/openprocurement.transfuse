@@ -610,6 +610,8 @@ class TendersToSQL(object):
         self.total_processed = 0
         self.total_deleted = 0
         last_date = ''
+        last_total = 0
+
         if offset:
             self.client.params['offset'] = offset
 
@@ -620,8 +622,9 @@ class TendersToSQL(object):
             tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
 
             for tender in tenders_list:
-                if last_date < tender.dateModified[:10] or self.total_listed % 50000 == 0:
+                if last_date < tender.dateModified[:10] or self.total_listed - last_total > 10000:
                     last_date = tender.dateModified[:10]
+                    last_total = self.total_listed
                     insert_new = self.total_processed - self.total_deleted
                     logger.info("Total %d processed %d new %d upd %d last %s", self.total_listed,
                                 self.total_processed, insert_new, self.total_deleted, last_date)
