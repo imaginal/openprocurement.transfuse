@@ -15,20 +15,16 @@ from ConfigParser import RawConfigParser
 from munch import munchify
 from iso8601 import parse_date
 from datetime import datetime
+from restkit.client import get_session
 from restkit.errors import ResourceError, ResourceNotFound
 from openprocurement_client.client import APIBaseClient
 
-# NOTE: Hold a reference to Queue.Empty so at shutdown time it continues
-# being defined. Otherwise it's garbage collected and the daemon threads
-# may raise exceptions when Empty is equal to None at process termination.
-import Queue
-unused_Empty = Queue.Empty
 # fix for py2exe
 from socketpool import backend_thread
 unused_Queue = backend_thread.PriorityQueue
 
 
-__version__ = '2.1.1'
+__version__ = '2.1.2'
 
 logger = logging.getLogger('transfuse')
 
@@ -667,6 +663,18 @@ class TendersToSQL(object):
         for model_class in self.sorted_models:
             self.process_model_data(model_class, data)
 
+    def close_client(self):
+        self.client._pool.release_all()
+        del self.client
+
+
+def shutdown_sockets():
+    pool = get_session(backend="thread")
+    if hasattr(pool, 'stop_reaper'):
+        logger.info('Stop pool thread')
+        pool.stop_reaper()
+        time.sleep(0.1)
+
 
 def run_app(args):
     config = MyConfigParser(allow_no_value=True)
@@ -675,7 +683,9 @@ def run_app(args):
         config.read(inifile)
 
     app = TendersToSQL(config, args)
-    return app.run()
+    app.run()
+    app.close_client()
+    shutdown_sockets()
 
 
 def main():
