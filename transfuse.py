@@ -664,16 +664,25 @@ class TendersToSQL(object):
             self.process_model_data(model_class, data)
 
     def close_client(self):
-        self.client._pool.release_all()
+        self.client.client._pool.release_all()
         del self.client
 
 
-def shutdown_sockets():
-    pool = get_session(backend="thread")
-    if hasattr(pool, 'stop_reaper'):
-        logger.info('Stop pool thread')
-        pool.stop_reaper()
-        time.sleep(0.1)
+def create_socket_pool(backend="thread"):
+    get_session(backend, reap_connections=False)
+
+
+def shutdown_sockets(backend="thread"):
+    pool = get_session(backend)
+    if not pool:
+        return
+    try:
+        while pool._reaper and pool._reaper.running:
+            logger.info('Stop pool thread')
+            pool.stop_reaper()
+            time.sleep(0.5)
+    except AttributeError:
+        pass
 
 
 def run_app(args):
@@ -682,6 +691,7 @@ def run_app(args):
         config.test(inifile)
         config.read(inifile)
 
+    create_socket_pool()
     app = TendersToSQL(config, args)
     app.run()
     app.close_client()
