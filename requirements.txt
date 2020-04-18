@@ -1,6 +1,6 @@
-iso8601==0.1.11
-MySQL-python==1.2.5
-peewee==2.8.0
-restkit==4.2.2
-simplejson==3.8.2
--e git+https://github.com/openprocurement/openprocurement.client.python.git#egg=openprocurement_client
+iso8601==0.1.12
+munch==2.5.0
+peewee==3.13.2
+PyMySQL==0.9.3
+requests==2.23.0
+simplejson==3.17.0
