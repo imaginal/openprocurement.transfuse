@@ -7,24 +7,17 @@ import socket
 import logging
 import logging.config
 import simplejson as json
+import requests
 import peewee
-
-from argparse import ArgumentParser
-from ConfigParser import RawConfigParser
-
 from munch import munchify
 from iso8601 import parse_date
 from datetime import datetime
-from restkit.client import get_session
-from restkit.errors import ResourceError, ResourceNotFound
-from openprocurement_client.client import APIBaseClient
-
-# fix for py2exe
-from socketpool import backend_thread
-unused_Queue = backend_thread.PriorityQueue
+from argparse import ArgumentParser
+from ConfigParser import RawConfigParser
+assert peewee.__version__ >= '3.1'
 
 
-__version__ = '2.1.2'
+__version__ = '3.0b1'
 
 logger = logging.getLogger('transfuse')
 
@@ -47,89 +40,164 @@ class MyConfigParser(RawConfigParser):
         return True
 
 
-class MyApiClient(APIBaseClient):
-    def __init__(self, key, config):
-        params = {'limit': 1000, 'mode': ''}
-        if config['mode'] in ('test', '_all_'):
-            params['mode'] = config['mode']
-        timeout = float(config.get('timeout', 0))
-        if timeout > 0.01:
-            socket.setdefaulttimeout(timeout)
-        APIBaseClient.__init__(
-            self, key, config['host_url'], config['api_version'], config['resource'], params,
-            timeout=timeout)
-        self.headers['User-Agent'] = "Transfuse/%s %s" % (__version__, config['user_agent'])
-        self.limit_preload = int(config.get('preload', 0))
-        self.api_version = config['api_version']
-        self.log_cookie()
+class NotFoundError(Exception):
+    pass
 
-    def log_cookie(self):
-        logger.info("Cookie: %s", self.headers.get('Cookie'))
+
+class RetryError(Exception):
+    pass
+
+
+class MyApiClient(object):
+    def __init__(self, config):
+        self.session = requests.Session()
+        if 'url' in config:
+            self.prefix_path = config['url']
+        else:
+            self.prefix_path = '{}/api/{}/{}'.format(
+                config['host_url'],
+                config['api_version'],
+                config['resource'])
+        self.params = {'limit': 1000, 'mode': ''}
+        if config.get('mode', '') in ('test', '_all_'):
+            self.params['mode'] = config['mode']
+        if 'list_limit' in config:
+            self.params['limit'] = int(config['list_limit'])
+        self.timeout = float(config.get('timeout', 30))
+        if self.timeout and self.timeout > 0:
+            self.session.timeout = self.timeout
+        if 'auth' in config:
+            self.session.auth = tuple(config['auth'].split(':', 1))
+        elif 'key' in config:
+            self.session.auth = (config['key'], '')
+        user_agent = "Transfuse/%s %s" % (__version__, config['user_agent'])
+        self.session.headers.update({'User-Agent': user_agent})
+        self.preload_limit = int(config.get('preload', 0))
+        self.max_retry = int(config.get('max_retry', 5))
+        self.use_cookies = int(config.get('use_cookies', 1))
+        if self.use_cookies:
+            self.request_cookie()
+
+    def set_limit(self, limit):
+        if self.params['limit'] > limit:
+            self.params['limit'] = limit
+        if self.preload_limit > limit:
+            self.preload_limit = limit
+
+    def set_offset(self, offset):
+        self.params['offset'] = offset
 
     def request_cookie(self):
-        self.head('/api/{}/spore'.format(self.api_version))
-        self.log_cookie()
+        self.session.head(self.prefix_path, timeout=self.timeout)
+        logger.debug("Cookie: %s", self.session.cookies.items())
 
-    def preload_tenders(self, feed='', limit=0, callback=None):
+    def preload(self, feed='', limit=0, callback=None):
         preload_items = []
         items = True
-        if not self.headers.get('Cookie', None):
+        if self.use_cookies and not self.session.cookies:
             self.request_cookie()
         while items:
-            items = self.get_tenders(feed=feed)
+            items = self.get_list(feed=feed)
             if items:
                 preload_items.extend(items)
-            if self.limit_preload >= 0 and self.limit_preload < len(preload_items):
+            if self.preload_limit and self.preload_limit < len(preload_items):
                 break
             if items and callback:
                 callback(len(preload_items), items[-1])
         return preload_items
 
-    def log_request_error(self, msg, e=''):
-        logger.error("%s error %s", msg, str(e))
-        logger.error("Request params %s headers %s", self.params, self.headers)
-        if e and getattr(e, 'response', None):
-            logger.error("Response status %s headers %s", e.response.status_int, e.response.headers)
+    def log_request_error(self, url, exc, method='GET'):
+        logger.error("{} {} {}".format(method, url, repr(exc)))
+        if hasattr(exc, 'request') and getattr(exc, 'request', None):
+            request = exc.request
+            headers = "\n".join(["  {}: {}".format(*i) for i in request.headers.items()])
+            logger.debug("Request {} {}\n{}".format(request.method, request.url, headers))
+        if hasattr(exc, 'response') and getattr(exc, 'response', None):
+            response = exc.response
+            headers = "\n".join(["  {}: {}".format(*i) for i in response.headers.items()])
+            logger.debug("Response {}\n{}".format(response.status_code, headers))
 
-    def get_tenders(self, params={}, feed='changes'):
+    def get_list(self, params={}, feed='changes'):
         params['feed'] = feed
-        for i in range(5):
+        for i in range(self.max_retry):
             try:
-                self._update_params(params)
-                response = self.get(
-                    self.prefix_path,
-                    params_dict=self.params)
-                if response.status_int == 200:
-                    tender_list = munchify(json.loads(response.body_string()))
-                    self._update_params(tender_list.next_page)
-                    return tender_list.data
+                self.params.update(params)
+                response = self.session.get(self.prefix_path,
+                    params=self.params, timeout=self.timeout)
 
-                logger.warning("get_tenders response %d headers %s",
-                    response.status_int, str(response.headers))
+                if response.status_code == 404:
+                    raise NotFoundError("404 Not found {}".format(self.prefix_path))
+                else:
+                    response.raise_for_status()
 
-            except ResourceNotFound:
-                self.params.pop('offset', '')
-                raise
-            except (socket.error, ResourceError) as e:
-                self.log_request_error('get_tenders', e)
-                time.sleep(10 * i + 10)
+                resp_list = munchify(response.json())
+                if 'next_page' in resp_list and 'offset' in resp_list.next_page:
+                    self.params['offset'] = resp_list.next_page.offset
+                return resp_list.data
 
-        raise ResourceError("Maximum retry reached")
+            except (socket.error, requests.RequestException) as e:
+                self.log_request_error(self.prefix_path, e)
+                if i < self.max_retry - 1:
+                    time.sleep(10 * i + 10)
 
-    def get_tender(self, tender_id):
-        for i in range(5):
+        raise RetryError("Maximum retry reached for {}".format(self.prefix_path))
+
+    def get(self, item_id):
+        url = "{}/{}".format(self.prefix_path, item_id)
+        for i in range(self.max_retry):
             try:
-                if not self.headers.get('Cookie', None):
+                if self.use_cookies and not self.session.cookies:
                     self.request_cookie()
-                return self._get_resource_item('{}/{}'.format(self.prefix_path, tender_id))
+                response = self.session.get(url, timeout=self.timeout)
 
-            except (socket.error, ResourceError) as e:
-                self.log_request_error('get_tender/%s' % tender_id, e)
+                if response.status_code == 404:
+                    raise NotFoundError("404 Not found {}".format(url))
+                else:
+                    response.raise_for_status()
+
+                resp_data = munchify(response.json())
+                return resp_data.data
+
+            except (socket.error, requests.RequestException) as e:
+                self.log_request_error(url, e)
                 if i > 1:
-                    self.headers.pop('Cookie', None)
-                time.sleep(10 * i + 10)
+                    self.session.cookies.clear()
+                if i < self.max_retry - 1:
+                    time.sleep(10 * i + 10)
 
-        raise ResourceError("Maximum retry reached")
+        raise RetryError("Maximum retry reached for {}".format(url))
+
+
+def coerce_to_cp1251(value):
+    try:
+        value.encode('cp1251')
+    except AttributeError:
+        pass
+    except UnicodeEncodeError:
+        value = value.encode('cp1251', 'replace').decode('cp1251')
+    return value
+
+
+class MyPrimaryKeyField(peewee.AutoField):
+    pass
+
+
+class MyCharField(peewee.CharField):
+    utf8mb4 = False
+
+    def coerce(self, value):
+        if not self.utf8mb4:
+            value = coerce_to_cp1251(value)
+        return peewee.CharField.coerce(self, value)
+
+
+class MyTextField(peewee.TextField):
+    utf8mb4 = False
+
+    def coerce(self, value):
+        if not self.utf8mb4:
+            value = coerce_to_cp1251(value)
+        return peewee.TextField.coerce(self, value)
 
 
 class BaseTendersModel(peewee.Model):
@@ -138,7 +206,7 @@ class BaseTendersModel(peewee.Model):
 
     @classmethod
     def model_name(klass):
-        return klass._meta.db_table
+        return klass._meta.table_name
 
 
 class CacheTendersModel(BaseTendersModel):
@@ -150,6 +218,16 @@ class CacheTendersModel(BaseTendersModel):
 def avg(data):
     if data:
         return sum(data) / len(data)
+
+
+def safe_dumps(data):
+    return json.dumps(data, default=str, ensure_ascii=False, sort_keys=True)
+
+
+def join(data, sep=','):
+    if isinstance(data, (list, dict, tuple)):
+        return sep.join(map(str, data))
+    return str(data)
 
 
 class TendersToSQL(object):
@@ -190,9 +268,9 @@ class TendersToSQL(object):
     table_schema = {
     }
     field_types = {
-        'char': (peewee.CharField, {'null': True, 'max_length': CHAR_MAX_LENGTH}),
-        'longchar': (peewee.CharField, {'null': True, 'max_length': LONGCHAR_MAX_LENGTH}),
-        'text': (peewee.TextField, {'null': True}),
+        'char': (MyCharField, {'null': True, 'max_length': CHAR_MAX_LENGTH}),
+        'longchar': (MyCharField, {'null': True, 'max_length': LONGCHAR_MAX_LENGTH}),
+        'text': (MyTextField, {'null': True}),
         'date': (peewee.DateTimeField, {'null': True}),
         'now': (peewee.DateTimeField, {'default': datetime.now}),
         'int': (peewee.IntegerField, {'null': True}),
@@ -202,10 +280,12 @@ class TendersToSQL(object):
         'bool': (peewee.BooleanField, {'null': True})
     }
     field_overrides = {
-        'primary_key': 'int',
+        'auto': 'int',
         'bool': 'tinyint',
     }
     known_funcs = {
+        'json': safe_dumps,
+        'join': join,
         'count': len,
         'sum': sum,
         'min': min,
@@ -222,20 +302,34 @@ class TendersToSQL(object):
         self.client_config.update(config.items('client'))
         # update config from args
         self.update_config(args)
+        # all sockets default timeout
+        if config.has_option('socket', 'timeout'):
+            socket.setdefaulttimeout(config.getfloat('socket', 'timeout'))
         # create client
-        api_key = self.client_config.pop('key')
-        logger.info("Create client %s", self.client_config)
-        self.client = MyApiClient(api_key, self.client_config)
+        safe_config = dict(self.client_config)
+        safe_config.pop('key', None)
+        safe_config.pop('auth', None)
+        uri = safe_config.get('url', safe_config['host_url'])
+        logger.info("Create API client %s", uri)
+        logger.debug("Client config %s", safe_config)
+        self.client = MyApiClient(self.client_config)
         # log connection config w/o password
         safe_config = dict(self.server_config)
         safe_config.pop('passwd', None)
         safe_config.pop('password', None)
-        logger.info("Connect server %s", safe_config)
+        uri = "{}/{}".format(safe_config.get('host'),
+            safe_config.get('db', safe_config.get('database')))
+        logger.info("Connect to database %s", uri)
+        logger.debug("Database config %s", safe_config)
         # create database connection
         db_class = peewee.__dict__.get(self.server_config.pop('class'))
         self.db_init = self.server_config.pop('init', '').strip(' \'"')
         self.db_name = self.server_config.pop('db', None)
         self.db_ping = self.server_config.pop('ping', 0)
+        self.utf8mb4 = self.server_config.pop('utf8mb4', 0)
+        for param in ('connect_timeout', 'read_timeout', 'write_timeout'):
+            if param in self.server_config:
+                self.server_config[param] = float(self.server_config[param])
         if not self.db_name and self.server_config.get('database'):
             self.db_name = self.server_config.pop('database')
         self.database = db_class(self.db_name, **self.server_config)
@@ -258,16 +352,20 @@ class TendersToSQL(object):
         self.cache_model = None
         if self.no_cache or self.client_config['resume']:
             return
-        if not config.has_option('cache', 'table'):
+        if not config.has_section('cache'):
             return
-        cache_table = config.get('cache', 'table')
+        cache_config = dict(config.items('cache'))
+        cache_table = cache_config.get('table')
         if not cache_table:
             return
         logger.info("Init cache table `%s`", cache_table)
+        blob_type = cache_config.get('blob_type', 'BLOB')
+        max_size = int(cache_config.get('max_size', 65500))
+        CacheTendersModel.gzip_data.field_type = blob_type
         self.cache_model = CacheTendersModel
         self.cache_model._meta.database = self.database
-        self.cache_model._meta.db_table = cache_table
-        self.cache_max_size = 0xfff0
+        self.cache_model._meta.table_name = cache_table
+        self.cache_max_size = max_size
         self.cache_hit_count = 0
         self.cache_miss_count = 0
         try:
@@ -291,7 +389,6 @@ class TendersToSQL(object):
         return name.replace('.', '_').replace('(', '_').replace(')', '').strip()
 
     def compare_table(self, table_name, fields):
-        compiler = self.database.compiler()
         columns = self.database.get_columns(table_name)
         col_map = {c.name: c for c in columns}
         for col in columns:
@@ -300,31 +397,30 @@ class TendersToSQL(object):
         for name in fields.keys():
             if name not in col_map:
                 raise KeyError("Table %s filed %s not found in database" % (table_name, name))
-            data_type = col_map[name].data_type
-            db_field = fields[name].db_field
-            if data_type == db_field:
+            data_type = col_map[name].data_type.lower()
+            field_type = fields[name].field_type.lower()
+            if data_type == field_type:
                 continue
-            if data_type == compiler.get_column_type(db_field).lower():
-                continue
-            if data_type == self.field_overrides.get(db_field, ''):
+            if data_type == self.field_overrides.get(field_type, ''):
                 continue
             raise TypeError("Table %s filed %s type not euqal, re-create tables" % (table_name, name))
 
-        logger.info("Use existing table `%s`", table_name)
+        logger.debug("Use existing table %s", table_name)
 
     def create_table(self, model_class):
-        logger.warning("Drop & Create table `%s`", model_class._meta.db_table)
         with self.database.transaction():
             try:
                 model_class.select().count()
                 model_class.drop_table(fail_silently=True)
+                logger.warning("Drop table `%s`", model_class._meta.table_name)
             except peewee.DatabaseError:
                 self.database.rollback()
         with self.database.transaction():
             model_class.create_table()
+            logger.info("Create table `%s`", model_class._meta.table_name)
 
-    def init_model(self, table_name, table_schema, index_schema):
-        logger.info("Create model %s", table_name)
+    def init_model(self, table_name, table_schema, index_schema, filters):
+        logger.debug("Create model %s", table_name)
         if table_name in self.models:
             raise IndexError('Model %s already exists' % table_name)
 
@@ -332,6 +428,7 @@ class TendersToSQL(object):
         parsed_schema = list()
         table_options = {'__name__': table_name}
         index_options = []
+        filter_options = []
         has_primary_key = False
 
         for key, val in table_schema:
@@ -351,11 +448,13 @@ class TendersToSQL(object):
             if opts[0] not in self.field_types:
                 raise TypeError("Unknown type '%s' for field '%s'" % (opts[0], key))
             fieldtype, fieldopts = self.field_types.get(opts[0])
+            if self.utf8mb4 and hasattr(fieldtype, 'utf8mb4'):
+                fieldtype.utf8mb4 = self.utf8mb4
             if len(opts) > 1:
                 if opts[1] not in self.allowed_fieldopts:
                     raise ValueError("Unknown option '%s' for field '%s'" % (opts[1], key))
                 fieldopts = dict(fieldopts)
-                fieldopts[ opts[1] ] = True
+                fieldopts[opts[1]] = True
                 if opts[1] == 'primary_key':
                     has_primary_key = True
             if len(opts) > 2:
@@ -383,15 +482,43 @@ class TendersToSQL(object):
             logger.debug("+ INDEX %s ON %s %s", key, index_fields, unique)
             index_options.append((key, index_fields, unique))
 
+        for key, val in filters:
+            if "__" in key:
+                key, op = key.split("__", 1)
+            else:
+                op = "eq"
+            if op not in ('eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'in', 'notin',
+                          'between', 'empty', 'notempty', 'isnull', 'notnull'):
+                raise ValueError("Unknown condition '%s' for %s in %s" % (op, key, table_name))
+            if op in ('in', 'notin', 'between'):
+                val = val.split(',')
+            if op in ('between', 'notbetween') and len(val) != 2:
+                raise ValueError("%s filter require exact 2 values for %s in %s" % (op, key, table_name))
+            # convert value by field type
+            name = self.field_name(key)
+            for opts in parsed_schema:
+                if name == opts[0]:
+                    ftype = opts[3]
+                    if ftype in ('int', 'bigint'):
+                        val = int(val)
+                    elif ftype in ('float', 'decimal'):
+                        val = float(val)
+            # parse field path
+            funcs = key.replace(')', '').split('(')
+            chain = funcs.pop().split('.')
+            logger.debug("* FILTER %s %s %s", key, op, str(val))
+            filter_options.append((key, chain, funcs, op, val))
+
         if not has_primary_key:
-            fields['pk_id'] = peewee.PrimaryKeyField(primary_key=True)
+            fields['pk_id'] = MyPrimaryKeyField(primary_key=True)
         class_name = "%sModel" % table_name.title()
         model_class = type(class_name, (BaseTendersModel,), fields)
+        model_class._meta.filter_options = filter_options
         model_class._meta.index_options = index_options
         model_class._meta.table_options = table_options
         model_class._meta.table_schema = parsed_schema
         model_class._meta.database = self.database
-        model_class._meta.db_table = table_name
+        model_class._meta.table_name = table_name
         self.models[table_name] = model_class
         if self.client_config['resume']:
             self.compare_table(table_name, fields)
@@ -408,11 +535,15 @@ class TendersToSQL(object):
             if section.startswith('table:'):
                 table_schema = config.items(section)
                 table, name = section.split(':', 2)
+                filter_section = 'filter:' + name
+                filters = []
+                if config.has_section(filter_section):
+                    filters = config.items(filter_section)
                 index_section = 'index:' + name
                 index_schema = []
                 if config.has_section(index_section):
                     index_schema = config.items(index_section)
-                self.init_model(name, table_schema, index_schema)
+                self.init_model(name, table_schema, index_schema, filters)
 
         self.sorted_models = sorted(self.models.values(),
             key=lambda m: len(m._meta.table_options.get('__iter__', [])))
@@ -428,7 +559,15 @@ class TendersToSQL(object):
                 logger.info("CREATE %sINDEX %s ON %s (%s);", unique_str, name,
                     model_class.model_name(), ', '.join(fields))
                 with self.database.transaction():
-                    self.database.create_index(model_class, fields, unique)
+                    try:
+                        self.database.create_index(model_class, fields, unique)
+                    except Exception as e:
+                        message = repr(e)
+                        if self.ignore_errors:
+                            self.database.rollback()
+                            logger.error(message)
+                            return
+                        raise (type(e), type(e)(message), sys.exc_info()[2])
 
     def apply_func(self, fn, data):
         return self.known_funcs[fn](data)
@@ -484,11 +623,58 @@ class TendersToSQL(object):
             except Exception as e:
                 message = "%s on model [%s] field %s itemID=%s" % (str(e),
                     str(model_class.model_name()), name, data.get('id'))
-                raise type(e), type(e)(message), sys.exc_info()[2]
+                raise (type(e), type(e)(message), sys.exc_info()[2])
         item = model_class(**fields)
         item.save(force_insert=True)
 
+    def process_signle_filter(self, filter_opts, data):
+        key, chain, funcs, op, opval = filter_opts
+        value = self.field_value(chain, funcs, data)
+        # 'eq', 'ne', 'lt', 'lte', 'gt', 'gte', 'in', 'notin',
+        # 'between', 'empty', 'notempty', 'isnull', 'notnull'
+        if op == 'eq':
+            return value == opval
+        if op == 'ne':
+            return value != opval
+        if op == 'lt':
+            return value < opval
+        if op == 'lte':
+            return value <= opval
+        if op == 'gt':
+            return value > opval
+        if op == 'gte':
+            return value >= opval
+        if op == 'in':
+            return value in opval
+        if op == 'notin':
+            return value not in opval
+        if op == 'between':
+            return opval[0] <= value <= opval[1]
+        if op == 'empty':
+            return not value
+        if op == 'notempty':
+            return value or True
+        if op == 'isnull':
+            return value is None
+        if op == 'notnull':
+            return value is not None
+        raise ValueError("Unknwon filter condition %s" % op)
+
+    def process_filters(self, model_class, data):
+        for opts in model_class._meta.filter_options:
+            try:
+                if not self.process_signle_filter(opts, data):
+                    return False
+            except Exception as e:
+                message = "%s on model [%s] filter %s itemID=%s" % (str(e),
+                    str(model_class.model_name()), str(opts), data.get('id'))
+                raise (type(e), type(e)(message), sys.exc_info()[2])
+        return True
+
     def process_model_data(self, model_class, data):
+        if not self.process_filters(model_class, data):
+            logger.debug("Filter %s %s", model_class._meta.table_name, data.get('id', '-'))
+            return
         table_options = model_class._meta.table_options
         if table_options.get('__iter__'):
             iter_name = table_options['__iter__']
@@ -497,7 +683,7 @@ class TendersToSQL(object):
             root_name = table_options.get('__root__', 'root')
             if iter_list:
                 for item in iter_list:
-                    logger.info("+ Child %s %s", item.get('id', '-'), iter_path)
+                    logger.debug("+ Child %s %s", item.get('id', '-'), iter_path)
                     item[root_name] = data
                     self.process_model_item(model_class, item)
         else:
@@ -532,18 +718,21 @@ class TendersToSQL(object):
                     self.delete_model_data(model_class, tender)
 
     def process_tender(self, tender):
-        if self.db_ping:
-            self.ping_db_connection()
         if self.client_config['resume'] and self.tender_exists(tender, delete=True):
             logger.debug("Exists %s %s", tender.id, tender.dateModified)
+            self.total_exists += 1
             return
-        logger.info("Process %s %s", tender.id, tender.dateModified)
         data = self.get_from_cache(tender)
         if not data:
-            data = self.client.get_tender(tender.id)['data']
+            data = self.client.get(tender.id)
             self.save_to_cache(tender, data)
         if self.fill_cache:
+            logger.debug("Save %s %s", tender.id, tender.dateModified)
             return
+        if not self.process_filters(self.main_model, data):
+            logger.debug("Filter %s %s", tender.id, tender.dateModified)
+            return
+        logger.debug("Process %s %s", tender.id, tender.dateModified)
         with self.database.transaction():
             try:
                 for model_class in self.sorted_models:
@@ -555,10 +744,11 @@ class TendersToSQL(object):
                     self.database.rollback()
                     logger.error(message)
                     return
-                raise type(e), type(e)(message), sys.exc_info()[2]
+                raise (type(e), type(e)(message), sys.exc_info()[2])
+        return True
 
     def ping_db_connection(self):
-        conn = self.database.get_conn()
+        conn = self.database.connection()
         if hasattr(conn, 'ping'):
             conn.ping(True)
 
@@ -566,9 +756,9 @@ class TendersToSQL(object):
         if not self.cache_model:
             return None
         total_count = self.cache_hit_count + self.cache_miss_count
-        if total_count > 0 and total_count % 1000 == 0:
+        if total_count > 0 and total_count % 100000 == 0:
             usage = 100.0 * self.cache_hit_count / total_count
-            logger.info("Cache hit %d miss %d usage %1.0f %%",
+            logger.info("Cache hit %d miss %d usage %1.0f%%",
                 self.cache_hit_count, self.cache_miss_count, usage)
         try:
             item = self.cache_model.get(
@@ -585,7 +775,8 @@ class TendersToSQL(object):
             return False
         gzip_data = zlib.compress(json.dumps(data))
         if len(gzip_data) > self.cache_max_size:
-            logger.warning("Too big for cache %s", tender.id)
+            logger.warning("Too big for cache %s got size %d",
+                           tender.id, len(gzip_data))
             return False
         cache_item = self.cache_model(tender_id=tender.id,
                 dateModified=tender.dateModified,
@@ -597,45 +788,46 @@ class TendersToSQL(object):
         return True
 
     def onpreload(self, count, last):
-        logger.info("Preload %d last %s", count, last.get('dateModified', ''))
+        logger.debug("Preload %d last %s", count, last.get('dateModified', ''))
 
     def log_total(self, last_date):
         insert_new = self.total_inserted - self.total_deleted
-        ignored = self.total_listed - self.total_processed
-        logger.info("Total %d ignore %d new %d upd %d last %s", self.total_listed,
-                    ignored, insert_new, self.total_deleted, last_date)
+        logger.info("Total %d new %d upd %d last %s", self.total_listed,
+                    insert_new, self.total_deleted, last_date)
 
     def run(self):
         feed = self.client_config.get('feed', '')
         offset = self.client_config.get('offset', '')
         limit = int(self.client_config.get('limit') or 0)
         self.total_listed = 0
+        self.total_exists = 0
         self.total_processed = 0
         self.total_inserted = 0
         self.total_deleted = 0
-        last_date = ''
         last_total = 0
+        tender = None
+        stop = False
 
         if offset:
-            self.client.params['offset'] = offset
+            self.client.set_offset(offset)
 
-        if limit and self.client.limit_preload > limit:
-            self.client.limit_preload = limit
+        if limit:
+            self.client.set_limit(limit)
 
-        tenders_list = True
-
-        while tenders_list:
-            tenders_list = self.client.preload_tenders(feed=feed, callback=self.onpreload)
+        while not stop:
+            tenders_list = self.client.preload(feed=feed, callback=self.onpreload)
 
             if not tenders_list:
                 logger.info("No more records.")
                 break
 
+            if self.db_ping:
+                self.ping_db_connection()
+
             for tender in tenders_list:
-                if last_date < tender.dateModified[:10] or self.total_listed - last_total >= 10000:
-                    last_date = tender.dateModified[:10]
+                if self.total_listed - last_total >= 10000:
                     last_total = self.total_listed
-                    self.log_total(last_date)
+                    self.log_total(tender.dateModified)
 
                 self.total_listed += 1
 
@@ -643,15 +835,15 @@ class TendersToSQL(object):
                     logger.debug("Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
-                self.process_tender(tender)
-                self.total_processed += 1
+                if self.process_tender(tender):
+                    self.total_processed += 1
 
                 if limit and self.total_processed >= limit:
                     logger.info("Reached limit %d records, stop.", limit)
-                    tenders_list = False
+                    stop = True
                     break
 
-        self.log_total(last_date)
+        self.log_total(tender.dateModified if tender else '-')
 
         if not self.client_config['resume']:
             self.create_indexes()
@@ -663,27 +855,6 @@ class TendersToSQL(object):
         for model_class in self.sorted_models:
             self.process_model_data(model_class, data)
 
-    def close_client(self):
-        self.client.client._pool.release_all()
-        del self.client
-
-
-def create_socket_pool(backend="thread"):
-    get_session(backend, reap_connections=False)
-
-
-def shutdown_sockets(backend="thread"):
-    pool = get_session(backend)
-    if not pool:
-        return
-    try:
-        while pool._reaper and pool._reaper.running:
-            logger.info('Stop pool thread')
-            pool.stop_reaper()
-            time.sleep(0.5)
-    except AttributeError:
-        pass
-
 
 def run_app(args):
     config = MyConfigParser(allow_no_value=True)
@@ -691,15 +862,12 @@ def run_app(args):
         config.test(inifile)
         config.read(inifile)
 
-    create_socket_pool()
     app = TendersToSQL(config, args)
     app.run()
-    app.close_client()
-    shutdown_sockets()
 
 
 def main():
-    description = "Prozorro API to SQL server bridge v%s" % __version__
+    description = "Prozorro API to SQL database converter v%s" % __version__
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
