@@ -1,8 +1,11 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
+import os
 import sys
 import time
 import zlib
+import fcntl
+import atexit
 import socket
 import logging
 import logging.config
@@ -178,10 +181,6 @@ def coerce_to_cp1251(value):
     return value
 
 
-class MyPrimaryKeyField(peewee.AutoField):
-    pass
-
-
 class MyCharField(peewee.CharField):
     utf8mb4 = False
 
@@ -198,6 +197,10 @@ class MyTextField(peewee.TextField):
         if not self.utf8mb4:
             value = coerce_to_cp1251(value)
         return peewee.TextField.coerce(self, value)
+
+
+class MyPrimaryKeyField(peewee.AutoField):
+    pass
 
 
 class BaseTendersModel(peewee.Model):
@@ -228,6 +231,35 @@ def join(data, sep=','):
     if isinstance(data, (list, dict, tuple)):
         return sep.join(map(str, data))
     return str(data)
+
+
+def remove_pidfile(lockfile, filename, mypid):
+    if mypid != os.getpid():
+        return
+    logger.debug("Remove pidfile %s", filename)
+    lockfile.seek(0)
+    filepid = int(lockfile.readline(10))
+    fcntl.lockf(lockfile, fcntl.LOCK_UN)
+    lockfile.close()
+    if mypid == filepid:
+        os.remove(filename)
+
+
+def write_pidfile(filename):
+    if not filename:
+        return
+    # try get exclusive lock to prevent second start
+    mypid = os.getpid()
+    logger.info("Save process id %d to pidfile %s", mypid, filename)
+    try:
+        lockfile = open(filename, "w+")
+        fcntl.lockf(lockfile, fcntl.LOCK_EX + fcntl.LOCK_NB)
+        lockfile.write(str(mypid) + "\n")
+        lockfile.flush()
+        atexit.register(remove_pidfile, lockfile, filename, mypid)
+    except IOError as e:
+        logger.error("Could not open lock file %s (%s)", filename, e)
+        raise
 
 
 class TendersToSQL(object):
@@ -302,6 +334,11 @@ class TendersToSQL(object):
         self.client_config.update(config.items('client'))
         # update config from args
         self.update_config(args)
+        # create lockfile
+        lockfile = self.server_config.pop('lockfile', None)
+        lockfile = args.lockfile or lockfile
+        if lockfile:
+            write_pidfile(lockfile)
         # all sockets default timeout
         if config.has_option('socket', 'timeout'):
             socket.setdefaulttimeout(config.getfloat('socket', 'timeout'))
@@ -317,7 +354,7 @@ class TendersToSQL(object):
         safe_config = dict(self.server_config)
         safe_config.pop('passwd', None)
         safe_config.pop('password', None)
-        uri = "{}/{}".format(safe_config.get('host'),
+        uri = "{}/{}".format(safe_config.get('host', 'file://'),
             safe_config.get('db', safe_config.get('database')))
         logger.info("Connect to database %s", uri)
         logger.debug("Database config %s", safe_config)
@@ -526,6 +563,11 @@ class TendersToSQL(object):
             self.create_table(model_class)
         # check for main model
         if 'dateModified' in fields and '__iter__' not in table_options:
+            if not self.main_model:
+                self.main_model = model_class
+        elif '__main__' in table_options:
+            if self.main_model:
+                raise ValueError('Main model defined twice')
             self.main_model = model_class
 
     def create_models(self, config):
@@ -550,6 +592,8 @@ class TendersToSQL(object):
 
         if self.client_config['resume'] and not self.main_model:
             raise ValueError('Main model is required for resume mode')
+        if not self.main_model:
+            logger.warning('Main model is not defined in config')
 
     def create_indexes(self):
         for model_class in self.sorted_models:
@@ -661,6 +705,8 @@ class TendersToSQL(object):
         raise ValueError("Unknwon filter condition %s" % op)
 
     def process_filters(self, model_class, data):
+        if not model_class:
+            return True
         for opts in model_class._meta.filter_options:
             try:
                 if not self.process_signle_filter(opts, data):
@@ -739,7 +785,7 @@ class TendersToSQL(object):
                     self.process_model_data(model_class, data)
                 self.total_inserted += 1
             except Exception as e:
-                message = str(e) + " rootID=%s" % data.get('id')
+                message = "%s rootID=%s" % (repr(e), data.get('id'))
                 if self.ignore_errors:
                     self.database.rollback()
                     logger.error(message)
@@ -870,6 +916,7 @@ def main():
     description = "Prozorro API to SQL database converter v%s" % __version__
     parser = ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
+    parser.add_argument('-L', '--lockfile', type=str, help='create lockfile, prevent second start')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
@@ -908,7 +955,7 @@ def main():
         print "Press Enter to continue..."
         raw_input()
 
-    logger.info("Exit with code %d", exit_code)
+    logger.debug("Exit with code %d", exit_code)
 
     return exit_code
 
