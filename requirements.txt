@@ -1,6 +1,8 @@
+configparser==4.0.2
 iso8601==0.1.12
 munch==2.5.0
 peewee==3.13.2
 PyMySQL==0.9.3
 requests==2.23.0
 simplejson==3.17.0
+six==1.14.0
