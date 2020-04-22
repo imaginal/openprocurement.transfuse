@@ -3,32 +3,45 @@
 import os
 import sys
 import time
-import zlib
 import fcntl
 import atexit
+import argparse
+import codecs
+import collections
+import datetime
+import iso8601
+import munch
+import peewee
+import requests
+import warnings
 import socket
+import six
+import zlib
 import logging
 import logging.config
-import simplejson as json
-import requests
-import peewee
-from munch import munchify
-from iso8601 import parse_date
-from datetime import datetime
-from argparse import ArgumentParser
-from ConfigParser import RawConfigParser
+try:
+    import configparser
+except ImportError:
+    import ConfigParser as configparser
+try:
+    import simplejson as json
+except ImportError:
+    import json
+
 assert peewee.__version__ >= '3.1'
 
 
-__version__ = '3.0b1'
+__version__ = '3.0.3'
 
 logger = logging.getLogger('transfuse')
 
-CHAR_MAX_LENGTH = 250
-LONGCHAR_MAX_LENGTH = 1000
+if sys.version_info[0] < 3:
+    input = raw_input
+else:
+    unicode = str
 
 
-class MyConfigParser(RawConfigParser):
+class MyConfigParser(configparser.RawConfigParser):
     def optionxform(self, optionstr):
         return optionstr
 
@@ -81,6 +94,9 @@ class MyApiClient(object):
         if self.use_cookies:
             self.request_cookie()
 
+    def close(self):
+        self.session.close()
+
     def set_limit(self, limit):
         if self.params['limit'] > limit:
             self.params['limit'] = limit
@@ -103,6 +119,8 @@ class MyApiClient(object):
             items = self.get_list(feed=feed)
             if items:
                 preload_items.extend(items)
+            if items and len(items) < self.params['limit']:
+                break
             if self.preload_limit and self.preload_limit < len(preload_items):
                 break
             if items and callback:
@@ -133,10 +151,10 @@ class MyApiClient(object):
                 else:
                     response.raise_for_status()
 
-                resp_list = munchify(response.json())
-                if 'next_page' in resp_list and 'offset' in resp_list.next_page:
+                resp_list = munch.munchify(response.json())
+                if 'next_page' in resp_list and 'offset' in resp_list['next_page']:
                     self.params['offset'] = resp_list.next_page.offset
-                return resp_list.data
+                return resp_list['data']
 
             except (socket.error, requests.RequestException) as e:
                 self.log_request_error(self.prefix_path, e)
@@ -158,8 +176,8 @@ class MyApiClient(object):
                 else:
                     response.raise_for_status()
 
-                resp_data = munchify(response.json())
-                return resp_data.data
+                resp_data = munch.munchify(response.json())
+                return resp_data['data']
 
             except (socket.error, requests.RequestException) as e:
                 self.log_request_error(url, e)
@@ -171,36 +189,35 @@ class MyApiClient(object):
         raise RetryError("Maximum retry reached for {}".format(url))
 
 
-def coerce_to_cp1251(value):
-    try:
-        value.encode('cp1251')
-    except AttributeError:
-        pass
-    except UnicodeEncodeError:
-        value = value.encode('cp1251', 'replace').decode('cp1251')
-    return value
+class MyModelIndex(peewee.Index):
+    def __init__(self, model, fields, unique=False, safe=True, where=None,
+                 using=None, name=None):
+        self._model = model
+        if name is None:
+            f_names = [getattr(f, 'column_name', str(f)) for f in fields]
+            name = "{}_{}".format(model._meta.table_name, "_".join(f_names))
+        if getattr(model._meta, 'index_max_length', None):
+            index_max_length = model._meta.index_max_length
+            new_fields = list()
+            for field in fields:
+                if isinstance(field, peewee.CharField):
+                    column_name = "%s(%d)" % (field.column_name, index_max_length)
+                    new_fields.append(column_name)
+                else:
+                    new_fields.append(field)
+        else:
+            new_fields = fields
+        super(MyModelIndex, self).__init__(
+            name=name,
+            table=model._meta.table,
+            expressions=new_fields,
+            unique=unique,
+            safe=safe,
+            where=where,
+            using=using)
 
 
-class MyCharField(peewee.CharField):
-    utf8mb4 = False
-
-    def coerce(self, value):
-        if not self.utf8mb4:
-            value = coerce_to_cp1251(value)
-        return peewee.CharField.coerce(self, value)
-
-
-class MyTextField(peewee.TextField):
-    utf8mb4 = False
-
-    def coerce(self, value):
-        if not self.utf8mb4:
-            value = coerce_to_cp1251(value)
-        return peewee.TextField.coerce(self, value)
-
-
-class MyPrimaryKeyField(peewee.AutoField):
-    pass
+peewee.ModelIndex = MyModelIndex
 
 
 class BaseTendersModel(peewee.Model):
@@ -216,6 +233,33 @@ class CacheTendersModel(BaseTendersModel):
     tender_id = peewee.CharField(primary_key=True)
     dateModified = peewee.CharField()
     gzip_data = peewee.BlobField()
+
+
+def force_encoding(value, encoding='cp1251'):
+    try:
+        value.encode(encoding)
+    except AttributeError:
+        pass
+    except UnicodeEncodeError:
+        value = value.encode(encoding, 'replace').decode(encoding)
+    return value
+
+
+def relative_offset(offset):
+    if offset and offset[0] in ('+', '-'):
+        muls = {'d': 86400, 'h': 3600, 'm': 60, 's': 1}
+        if offset[-1] in muls:
+            seconds = muls[offset[-1]] * int(offset[1:-1])
+        else:
+            seconds = int(offset[1:])
+        toffs = datetime.datetime.now()
+        delta = datetime.timedelta(seconds=seconds)
+        if offset[0] == '+':
+            toffs += delta
+        else:
+            toffs -= delta
+        offset = toffs.isoformat()
+    return offset
 
 
 def avg(data):
@@ -238,31 +282,46 @@ def remove_pidfile(lockfile, filename, mypid):
         return
     logger.debug("Remove pidfile %s", filename)
     lockfile.seek(0)
-    filepid = int(lockfile.readline(10))
+    filepid = int(lockfile.readline(10) or 0)
     fcntl.lockf(lockfile, fcntl.LOCK_UN)
     lockfile.close()
     if mypid == filepid:
         os.remove(filename)
 
 
-def write_pidfile(filename):
+def write_pidfile(filename, wait=0):
     if not filename:
         return
     # try get exclusive lock to prevent second start
     mypid = os.getpid()
-    logger.info("Save process id %d to pidfile %s", mypid, filename)
-    try:
-        lockfile = open(filename, "w+")
-        fcntl.lockf(lockfile, fcntl.LOCK_EX + fcntl.LOCK_NB)
-        lockfile.write(str(mypid) + "\n")
-        lockfile.flush()
-        atexit.register(remove_pidfile, lockfile, filename, mypid)
-    except IOError as e:
-        logger.error("Could not open lock file %s (%s)", filename, e)
-        raise
+    logger.info("Save process id %d to %s", mypid, filename)
+    lockfile = None
+    for i in range(wait + 1):
+        try:
+            lockfile = open(filename, "w+")
+            fcntl.lockf(lockfile, fcntl.LOCK_EX + fcntl.LOCK_NB)
+            lockfile.write(str(mypid) + "\n")
+            lockfile.flush()
+            atexit.register(remove_pidfile, lockfile, filename, mypid)
+        except IOError as e:
+            logger.error("Could not open lock file %s (%s)", filename, e)
+            if lockfile:
+                lockfile.close()
+            if i == wait:
+                raise
+            time.sleep(1)
+            continue
+        break
 
 
 class TendersToSQL(object):
+    CHAR_MAX_LENGTH = 250
+    general_config = {
+        'timeout': 0,
+        'lockfile': None,
+        'lockwait': 0,
+        'warnings': "error",
+    }
     client_config = {
         'key': "",
         'host_url': "https://public.api.openprocurement.org",
@@ -274,6 +333,7 @@ class TendersToSQL(object):
         'offset': None,
         'limit': None,
         'resume': False,
+        'ignore': False,
         'preload': 0,
         'timeout': 30,
     }
@@ -286,6 +346,7 @@ class TendersToSQL(object):
             'user': 'prozorro',
             'passwd': 'prozorro',
             'db': 'prozorro',
+            'index_max_length': 40,
         },
         'PostgresqlDatabase': {
             'host': 'localhost',
@@ -300,16 +361,18 @@ class TendersToSQL(object):
     table_schema = {
     }
     field_types = {
-        'char': (MyCharField, {'null': True, 'max_length': CHAR_MAX_LENGTH}),
-        'longchar': (MyCharField, {'null': True, 'max_length': LONGCHAR_MAX_LENGTH}),
-        'text': (MyTextField, {'null': True}),
+        'char': (peewee.CharField, {'null': True, 'max_length': CHAR_MAX_LENGTH}),
+        'text': (peewee.TextField, {'null': True}),
         'date': (peewee.DateTimeField, {'null': True}),
-        'now': (peewee.DateTimeField, {'default': datetime.now}),
+        'now': (peewee.DateTimeField, {'default': datetime.datetime.now}),
         'int': (peewee.IntegerField, {'null': True}),
         'bigint': (peewee.BigIntegerField, {'null': True}),
         'float': (peewee.FloatField, {'null': True}),
         'decimal': (peewee.DecimalField, {'null': True, 'max_digits': 20, 'decimal_places': 2}),
         'bool': (peewee.BooleanField, {'null': True})
+    }
+    type_aliases = {
+        'longchar': 'char,max_length:2500'
     }
     field_overrides = {
         'auto': 'int',
@@ -324,7 +387,13 @@ class TendersToSQL(object):
         'max': max,
         'avg': avg,
     }
-    allowed_fieldopts = ['null', 'index', 'unique', 'primary_key']
+    allowed_fieldargs = ['null', 'index', 'unique', 'primary_key',
+        'max_length', 'max_digits', 'decimal_places', 'auto_round']
+    allowed_fieldopts = ['column_name', 'default', 'collation']
+    fieldopt_synonims = {'pk': 'primary_key', 'len': 'max_length',
+        'digits': 'max_digits', 'decimal': 'decimal_places',
+        'enc': 'encoding', 'charset': 'encoding', 'trunc': 'truncate',
+        'name': 'column_name'}
 
     def __init__(self, config, args):
         db_class = config.get('server', 'class')
@@ -332,16 +401,22 @@ class TendersToSQL(object):
             self.server_config.update(self.server_defaults[db_class])
         self.server_config.update(config.items('server'))
         self.client_config.update(config.items('client'))
+        self.type_aliases.update(config.items('aliases'))
+        self.general_config.update(config.items('general'))
         # update config from args
         self.update_config(args)
         # create lockfile
-        lockfile = self.server_config.pop('lockfile', None)
-        lockfile = args.lockfile or lockfile
-        if lockfile:
-            write_pidfile(lockfile)
+        if self.general_config['lockfile']:
+            filename = self.general_config['lockfile']
+            wait = int(self.general_config['lockwait'] or 0)
+            write_pidfile(filename, wait)
+        # setup warnings
+        if self.general_config['warnings'] and not args.ignore:
+            warnings.simplefilter(self.general_config['warnings'])
         # all sockets default timeout
-        if config.has_option('socket', 'timeout'):
-            socket.setdefaulttimeout(config.getfloat('socket', 'timeout'))
+        timeout = float(self.general_config['timeout'] or 0)
+        if timeout > 0.001:
+            socket.setdefaulttimeout(timeout)
         # create client
         safe_config = dict(self.client_config)
         safe_config.pop('key', None)
@@ -363,7 +438,14 @@ class TendersToSQL(object):
         self.db_init = self.server_config.pop('init', '').strip(' \'"')
         self.db_name = self.server_config.pop('db', None)
         self.db_ping = self.server_config.pop('ping', 0)
-        self.utf8mb4 = self.server_config.pop('utf8mb4', 0)
+        self.force_encoding = self.server_config.pop('force_encoding', 0)
+        if self.force_encoding:
+            codecs.lookup(self.force_encoding)
+        index_max_length = self.server_config.pop('index_max_length', 0)
+        self.index_max_length = int(index_max_length)
+        for param in ('port',):
+            if param in self.server_config:
+                self.server_config[param] = int(self.server_config[param])
         for param in ('connect_timeout', 'read_timeout', 'write_timeout'):
             if param in self.server_config:
                 self.server_config[param] = float(self.server_config[param])
@@ -378,11 +460,15 @@ class TendersToSQL(object):
         self.init_cache(config)
 
     def update_config(self, args):
+        for key in ('lockfile', 'lockwait'):
+            if getattr(args, key, None):
+                self.general_config[key] = getattr(args, key)
         for key in ('offset', 'limit', 'resume'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
-        for key in ('no_cache', 'drop_cache', 'fill_cache'):
+        for key in ('no_cache', 'drop_cache', 'fill_cache', 'verbose', 'debug'):
             setattr(self, key, getattr(args, key, False))
+        self.loglevel = logging.INFO if self.verbose else logging.DEBUG
         self.ignore_errors = args.ignore
 
     def init_cache(self, config):
@@ -397,7 +483,7 @@ class TendersToSQL(object):
             return
         logger.info("Init cache table `%s`", cache_table)
         blob_type = cache_config.get('blob_type', 'BLOB')
-        max_size = int(cache_config.get('max_size', 65500))
+        max_size = int(cache_config.get('max_size', 65530))
         CacheTendersModel.gzip_data.field_type = blob_type
         self.cache_model = CacheTendersModel
         self.cache_model._meta.database = self.database
@@ -413,13 +499,13 @@ class TendersToSQL(object):
         except peewee.DatabaseError:
             cache_table_exists = False
             self.database.rollback()
-        if self.drop_cache and cache_table_exists:
+        if self.drop_cache:
             logger.warning("Drop cache table `%s`", cache_table)
-            self.cache_model.drop_table()
+            self.cache_model.drop_table(safe=True)
             cache_table_exists = False
         if not cache_table_exists:
             logger.info("Create cache table `%s`", cache_table)
-            self.cache_model.create_table()
+            self.cache_model.create_table(safe=True)
 
     @staticmethod
     def field_name(name):
@@ -444,25 +530,36 @@ class TendersToSQL(object):
 
         logger.debug("Use existing table %s", table_name)
 
+    def model_row_size(self, model_class):
+        row_size = 0
+        for field in model_class._meta.fields.values():
+            if isinstance(field, peewee.CharField):
+                row_size += 2 * field.max_length + 4
+            elif isinstance(field, (peewee.IntegerField, peewee.BooleanField)):
+                row_size += 4
+            else:
+                row_size += 8
+        return row_size
+
     def create_table(self, model_class):
         with self.database.transaction():
             try:
-                model_class.select().count()
-                model_class.drop_table(fail_silently=True)
+                model_class.drop_table(safe=True)
                 logger.warning("Drop table `%s`", model_class._meta.table_name)
             except peewee.DatabaseError:
                 self.database.rollback()
         with self.database.transaction():
-            model_class.create_table()
-            logger.info("Create table `%s`", model_class._meta.table_name)
+            logger.info("Create table `%s` (row size %d)", model_class._meta.table_name,
+                self.model_row_size(model_class))
+            model_class.create_table(safe=True)
 
     def init_model(self, table_name, table_schema, index_schema, filters):
-        logger.debug("Create model %s", table_name)
+        logger.log(self.loglevel, "Create model %s", table_name)
         if table_name in self.models:
-            raise IndexError('Model %s already exists' % table_name)
+            raise KeyError('Model %s already exists' % table_name)
 
-        fields = dict()
-        parsed_schema = list()
+        fields = collections.OrderedDict()
+        parsed_schema = collections.OrderedDict()
         table_options = {'__name__': table_name}
         index_options = []
         filter_options = []
@@ -477,34 +574,57 @@ class TendersToSQL(object):
                 continue
             name = self.field_name(key)
             if name in fields:
-                raise IndexError('Model %s field %s already exists' % (table_name, name))
+                raise KeyError('Model %s field %s already exists' % (table_name, name))
             logger.debug("+ %s %s", name, val)
             opts = [s.strip() for s in val.split(',')]
             # [table:model_name]
-            # field = type,flags,max_length
-            if opts[0] not in self.field_types:
-                raise TypeError("Unknown type '%s' for field '%s'" % (opts[0], key))
-            fieldtype, fieldopts = self.field_types.get(opts[0])
-            if self.utf8mb4 and hasattr(fieldtype, 'utf8mb4'):
-                fieldtype.utf8mb4 = self.utf8mb4
+            # field = type,option,option:value
+            ftype = opts[0]
+            if ftype in self.type_aliases:
+                opts[0] = self.type_aliases[ftype]
+                opts = [s.strip() for s in ','.join(opts).split(',')]
+                ftype = opts[0]
+            if ftype not in self.field_types:
+                raise TypeError("Unknown type '%s' for field '%s'" % (ftype, key))
+            field_class, fieldopts = self.field_types.get(ftype)
+            extraopts = None
             if len(opts) > 1:
-                if opts[1] not in self.allowed_fieldopts:
-                    raise ValueError("Unknown option '%s' for field '%s'" % (opts[1], key))
                 fieldopts = dict(fieldopts)
-                fieldopts[opts[1]] = True
-                if opts[1] == 'primary_key':
-                    has_primary_key = True
-            if len(opts) > 2:
-                fieldopts['max_length'] = int(opts[2])
-            fields[name] = fieldtype(**fieldopts)
+                extraopts = dict()
+                for opt in opts[1:]:
+                    val = 1
+                    if ':' in opt:
+                        opt, val = opt.split(':', 1)
+                    if opt == 'not_null':
+                        opt = 'null'
+                        val = 0
+                    if opt in self.fieldopt_synonims:
+                        opt = self.fieldopt_synonims[opt]
+                    if opt == 'primary_key':
+                        has_primary_key = True
+                    if opt == 'encoding':
+                        codecs.lookup(val)
+                        extraopts[opt] = val
+                    elif opt in ('truncate', 'ignore'):
+                        extraopts[opt] = int(val)
+                    elif opt in self.allowed_fieldargs:
+                        fieldopts[opt] = int(val)
+                    elif opt in self.allowed_fieldopts:
+                        fieldopts[opt] = val
+                    else:
+                        raise ValueError("Unknown option '%s' for field '%s' table [%s]"
+                            % (opt, key, table_name))
+            fields[name] = field_class(**fieldopts)
             # parse field path
             funcs = key.replace(')', '').split('(')
             chain = funcs.pop().split('.')
             for f in funcs:
                 if f not in self.known_funcs:
-                    raise IndexError("Unknown function '%s' in field '%s'" % (f, key))
-            parsed_schema.append((name, chain, funcs, opts[0]))
+                    raise KeyError("Unknown function '%s' in field '%s' table [%s]"
+                        % (f, key, table_name))
+            parsed_schema[name] = (chain, funcs, ftype, fieldopts, extraopts)
 
+        # parse indexes
         for key, val in index_schema:
             index_fields = []
             unique = False
@@ -512,13 +632,23 @@ class TendersToSQL(object):
                 val = val.replace('unique:', '')
                 unique = True
             for name in val.split(','):
+                # check for filed(length)
+                if '(' in name:
+                    name, index_max_length = name.replace(')', '').split('(', 1)
+                    index_max_length = int(index_max_length or self.index_max_length)
+                else:
+                    index_max_length = self.index_max_length
                 name = self.field_name(name)
                 if name not in fields:
-                    raise IndexError('Model %s index %s field %s not found' % (table_name, key, name))
+                    raise KeyError('Model %s index %s field %s not found' % (table_name, key, name))
+                ftype = parsed_schema[name][2]
+                if ftype in ('char', 'text') and index_max_length:
+                    name = "%s(%d)" % (name, index_max_length)
                 index_fields.append(name)
             logger.debug("+ INDEX %s ON %s %s", key, index_fields, unique)
             index_options.append((key, index_fields, unique))
 
+        # parse filters
         for key, val in filters:
             if "__" in key:
                 key, op = key.split("__", 1)
@@ -530,16 +660,28 @@ class TendersToSQL(object):
             if op in ('in', 'notin', 'between'):
                 val = val.split(',')
             if op in ('between', 'notbetween') and len(val) != 2:
-                raise ValueError("%s filter require exact 2 values for %s in %s" % (op, key, table_name))
+                raise ValueError("%s filter require exact 2 values for '%s' in [%s]" % (op, key,
+                                 table_name))
             # convert value by field type
             name = self.field_name(key)
-            for opts in parsed_schema:
-                if name == opts[0]:
-                    ftype = opts[3]
-                    if ftype in ('int', 'bigint'):
-                        val = int(val)
-                    elif ftype in ('float', 'decimal'):
-                        val = float(val)
+            conv = None
+            if name in parsed_schema:
+                # (chain, funcs, ftype, fieldopts, extraopts)
+                ftype = parsed_schema[name][2]
+                if ftype in ('int', 'bigint'):
+                    conv = int
+                elif ftype in ('float', 'decimal'):
+                    conv = float
+                elif ftype in ('char', 'longchar', 'text'):
+                    conv = unicode
+            if conv:
+                try:
+                    if isinstance(val, list):
+                        val = map(conv, val)
+                    else:
+                        val = conv(val)
+                except Exception as e:
+                    raise ValueError("Could not convert filter %s to %s: %s", name, ftype, repr(e))
             # parse field path
             funcs = key.replace(')', '').split('(')
             chain = funcs.pop().split('.')
@@ -547,9 +689,10 @@ class TendersToSQL(object):
             filter_options.append((key, chain, funcs, op, val))
 
         if not has_primary_key:
-            fields['pk_id'] = MyPrimaryKeyField(primary_key=True)
-        class_name = "%sModel" % table_name.title()
+            fields['pk_id'] = peewee.AutoField(primary_key=True)
+        class_name = str("%s__Model" % table_name.title())
         model_class = type(class_name, (BaseTendersModel,), fields)
+        model_class._meta.index_max_length = self.index_max_length
         model_class._meta.filter_options = filter_options
         model_class._meta.index_options = index_options
         model_class._meta.table_options = table_options
@@ -571,7 +714,7 @@ class TendersToSQL(object):
             self.main_model = model_class
 
     def create_models(self, config):
-        self.models = dict()
+        self.models = collections.OrderedDict()
         self.main_model = None
         for section in config.sections():
             if section.startswith('table:'):
@@ -600,18 +743,25 @@ class TendersToSQL(object):
             index_options = model_class._meta.index_options
             for name, fields, unique in index_options:
                 unique_str = 'UNIQUE ' if unique else ''
+                table_name = model_class.model_name()
+                name = "%s_%s" % (table_name, name)
                 logger.info("CREATE %sINDEX %s ON %s (%s);", unique_str, name,
-                    model_class.model_name(), ', '.join(fields))
+                    table_name, ', '.join(fields))
                 with self.database.transaction():
                     try:
-                        self.database.create_index(model_class, fields, unique)
+                        table = model_class._meta.table
+                        index = peewee.Index(name, table, fields, unique, safe=True)
+                        self.database.execute(index)
                     except Exception as e:
-                        message = repr(e)
+                        message = "%s on create_index %s %s %s" % (str(e),
+                            name, table_name, str(fields))
                         if self.ignore_errors:
+                            logger.error("%s: %s (ignored)", type(e).__name__, message)
                             self.database.rollback()
-                            logger.error(message)
                             return
-                        raise (type(e), type(e)(message), sys.exc_info()[2])
+                        logger.debug("%s: %s", repr(e), message)
+                        six.reraise(type(e), type(e)(message), sys.exc_info()[2])
+                        raise
 
     def apply_func(self, fn, data):
         return self.known_funcs[fn](data)
@@ -642,32 +792,48 @@ class TendersToSQL(object):
 
     @staticmethod
     def parse_iso_datetime(value):
-        return parse_date(value).replace(tzinfo=None)
+        return iso8601.parse_date(value).replace(tzinfo=None)
 
     def process_model_item(self, model_class, data):
-        table_schema = model_class._meta.table_schema
         fields = dict()
-        for field_info in table_schema:
-            name, chain, funcs, ftype = field_info
+        table_schema = model_class._meta.table_schema
+        for name in table_schema:
+            # (chain, funcs, ftype, fieldopts, extraopts)
+            chain, funcs, ftype, fieldopts, extraopts = table_schema[name]
             try:
                 value = self.field_value(chain, funcs, data)
                 if isinstance(value, list):
                     value = value[0] if len(value) else None
                 if value is None:
                     continue
-                if ftype in ['char', 'longchar', 'text']:
+                if ftype in ('char', 'longchar', 'text'):
                     value = unicode(value)
-                if ftype == 'char' and len(value) > CHAR_MAX_LENGTH:
-                    raise ValueError("Value too long, use longchar or text")
-                if ftype == 'longchar' and len(value) > LONGCHAR_MAX_LENGTH:
-                    value = value[:LONGCHAR_MAX_LENGTH]
+                    if extraopts and 'encoding' in extraopts:
+                        value = force_encoding(value, extraopts['encoding'])
+                    elif self.force_encoding:
+                        value = force_encoding(value, self.force_encoding)
+                    if extraopts and 'truncate' in extraopts:
+                        truncate = extraopts['truncate']
+                        if len(value) > truncate:
+                            value = value[:truncate]
+                if ftype == 'char':
+                    max_length = fieldopts.get('max_length', self.CHAR_MAX_LENGTH)
+                    ignore = extraopts and 'ignore' in extraopts
+                    if len(value) > max_length and not ignore:
+                        raise ValueError("Value is too long, use text or truncate" % name)
                 if ftype == 'date':
                     value = self.parse_iso_datetime(value)
                 fields[name] = value
             except Exception as e:
-                message = "%s on model [%s] field %s itemID=%s" % (str(e),
-                    str(model_class.model_name()), name, data.get('id'))
-                raise (type(e), type(e)(message), sys.exc_info()[2])
+                message = "%s on field '%s' table [%s] itemID=%s" % (str(e),
+                    name, model_class.model_name(), data.get('id'))
+                if extraopts and 'ignore' in extraopts:
+                    logger.error("%s: %s (ignored)", type(e).__name__, message)
+                else:
+                    logger.debug("%s: %s", repr(e), message)
+                    six.reraise(type(e), type(e)(message), sys.exc_info()[2])
+                    raise
+
         item = model_class(**fields)
         item.save(force_insert=True)
 
@@ -712,14 +878,17 @@ class TendersToSQL(object):
                 if not self.process_signle_filter(opts, data):
                     return False
             except Exception as e:
-                message = "%s on model [%s] filter %s itemID=%s" % (str(e),
+                message = "%s on table [%s] filter %s itemID=%s" % (str(e),
                     str(model_class.model_name()), str(opts), data.get('id'))
-                raise (type(e), type(e)(message), sys.exc_info()[2])
+                logger.debug("%s: %s", repr(e), message)
+                six.reraise(type(e), type(e)(message), sys.exc_info()[2])
+                raise
         return True
 
     def process_model_data(self, model_class, data):
         if not self.process_filters(model_class, data):
-            logger.debug("Filter %s %s", model_class._meta.table_name, data.get('id', '-'))
+            logger.log(self.loglevel, "Filter %s %s", model_class._meta.table_name,
+                data.get('id', '-'))
             return
         table_options = model_class._meta.table_options
         if table_options.get('__iter__'):
@@ -741,10 +910,10 @@ class TendersToSQL(object):
             root_name = table_options.get('__root__', 'root')
             root_id = getattr(model_class, '%s_id' % root_name)
             deleted = model_class.delete().where(root_id == tender.id).execute()
-            logger.debug("Delete child %s %d rows", table_options['__path__'], deleted)
+            logger.log(self.loglevel, "Delete child %s %d rows", table_options['__path__'], deleted)
         else:
             deleted = model_class.delete().where(model_class.id == tender.id).execute()
-            logger.debug("Delete root %s %d row", model_class.model_name(), deleted)
+            logger.log(self.loglevel, "Delete root %s %d row", model_class.model_name(), deleted)
 
     def tender_exists(self, tender, delete=False):
         try:
@@ -757,15 +926,20 @@ class TendersToSQL(object):
             return None
 
         if found and delete:
-            logger.debug("Delete %s %s", found.id, found.dateModified)
+            logger.log(self.loglevel, "Delete %s %s", found.id, found.dateModified)
             self.total_deleted += 1
             with self.database.transaction():
                 for model_class in reversed(self.sorted_models):
                     self.delete_model_data(model_class, tender)
+        return found
 
     def process_tender(self, tender):
         if self.client_config['resume'] and self.tender_exists(tender, delete=True):
-            logger.debug("Exists %s %s", tender.id, tender.dateModified)
+            logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
+            self.total_exists += 1
+            return
+        if self.client_config['ignore'] and self.tender_exists(tender, delete=False):
+            logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
             self.total_exists += 1
             return
         data = self.get_from_cache(tender)
@@ -773,24 +947,27 @@ class TendersToSQL(object):
             data = self.client.get(tender.id)
             self.save_to_cache(tender, data)
         if self.fill_cache:
-            logger.debug("Save %s %s", tender.id, tender.dateModified)
+            logger.log(self.loglevel, "Save %s %s", tender.id, tender.dateModified)
             return
         if not self.process_filters(self.main_model, data):
-            logger.debug("Filter %s %s", tender.id, tender.dateModified)
+            logger.log(self.loglevel, "Filter %s %s", tender.id, tender.dateModified)
             return
-        logger.debug("Process %s %s", tender.id, tender.dateModified)
+        logger.log(self.loglevel, "Process %s %s", tender.id, tender.dateModified)
         with self.database.transaction():
             try:
                 for model_class in self.sorted_models:
                     self.process_model_data(model_class, data)
                 self.total_inserted += 1
             except Exception as e:
-                message = "%s rootID=%s" % (repr(e), data.get('id'))
+                message = "%s table [%s] rootID=%s" % (str(e),
+                    model_class.model_name(), data.get('id'))
                 if self.ignore_errors:
+                    logger.error("%s: %s (ignored)", type(e).__name__, message)
                     self.database.rollback()
-                    logger.error(message)
                     return
-                raise (type(e), type(e)(message), sys.exc_info()[2])
+                logger.debug("%s: %s", repr(e), message)
+                six.reraise(type(e), type(e)(message), sys.exc_info()[2])
+                raise
         return True
 
     def ping_db_connection(self):
@@ -814,27 +991,35 @@ class TendersToSQL(object):
             self.cache_miss_count += 1
             return None
         self.cache_hit_count += 1
-        return munchify(json.loads(zlib.decompress(item.gzip_data)))
+        json_data = zlib.decompress(item.gzip_data)
+        return munch.munchify(json.loads(json_data))
 
     def save_to_cache(self, tender, data):
         if not self.cache_model:
             return False
-        gzip_data = zlib.compress(json.dumps(data))
+        json_data = json.dumps(data, ensure_ascii=False, separators=(',', ':'))
+        if isinstance(json_data, six.text_type):
+            json_data = json_data.encode('utf-8')
+        gzip_data = zlib.compress(json_data)
         if len(gzip_data) > self.cache_max_size:
-            logger.warning("Too big for cache %s got size %d",
-                           tender.id, len(gzip_data))
+            logger.warning("Too big for cache %s size %d gzip %d",
+                           tender.id, len(json_data), len(gzip_data))
             return False
         cache_item = self.cache_model(tender_id=tender.id,
                 dateModified=tender.dateModified,
                 gzip_data=gzip_data)
         try:
-            cache_item.save(force_insert=True)
+            field_dict = cache_item.__data__.copy()
+            cache_item.insert(**field_dict).on_conflict(
+                preserve=('dateModified', 'gzip_data')).execute()
         except peewee.IntegrityError:
             cache_item.save()
         return True
 
     def onpreload(self, count, last):
-        logger.debug("Preload %d last %s", count, last.get('dateModified', ''))
+        logger.log(self.loglevel, "Preload %d last %s", count, last.get('dateModified', ''))
+        if self.db_ping:
+            self.ping_db_connection()
 
     def log_total(self, last_date):
         insert_new = self.total_inserted - self.total_deleted
@@ -854,10 +1039,16 @@ class TendersToSQL(object):
         tender = None
         stop = False
 
+        if feed:
+            logger.info("Set client feed to %s", feed)
+
         if offset:
+            offset = relative_offset(offset)
+            logger.info("Set client offset to %s", offset)
             self.client.set_offset(offset)
 
         if limit:
+            logger.info("Set client limit to %d", limit)
             self.client.set_limit(limit)
 
         while not stop:
@@ -878,7 +1069,7 @@ class TendersToSQL(object):
                 self.total_listed += 1
 
                 if offset and offset > tender.dateModified:
-                    logger.debug("Ignore %s %s", tender.id, tender.dateModified)
+                    logger.log(self.loglevel, "Ignore %s %s", tender.id, tender.dateModified)
                     continue
 
                 if self.process_tender(tender):
@@ -897,9 +1088,19 @@ class TendersToSQL(object):
     def run_debug(self):
         with open('debug/tender.json') as f:
             tender = json.load(f)
-        data = munchify(tender['data'])
+        data = munch.munchify(tender['data'])
         for model_class in self.sorted_models:
             self.process_model_data(model_class, data)
+
+    def close(self):
+        self.database.close()
+        self.client.close()
+
+
+def formatwarning(message, category, filename, lineno, line=None):
+    if len(filename) > 30:
+        filename = "..." + filename[-27:]
+    return "%s:%s: %s: %s" % (filename, lineno, category.__name__, message)
 
 
 def run_app(args):
@@ -909,14 +1110,16 @@ def run_app(args):
         config.read(inifile)
 
     app = TendersToSQL(config, args)
-    app.run()
+    try:
+        app.run()
+    finally:
+        app.close()
 
 
 def main():
     description = "Prozorro API to SQL database converter v%s" % __version__
-    parser = ArgumentParser(description=description)
+    parser = argparse.ArgumentParser(description=description)
     parser.add_argument('config', nargs='+', help='ini file(s)')
-    parser.add_argument('-L', '--lockfile', type=str, help='create lockfile, prevent second start')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
@@ -924,12 +1127,17 @@ def main():
     parser.add_argument('-x', '--drop-cache', action='store_true', help="clear cache")
     parser.add_argument('-f', '--fill-cache', action='store_true', help="only save to cache")
     parser.add_argument('-n', '--no-cache', action='store_true', help="don't use cache")
+    parser.add_argument('-v', '--verbose', action='store_true', help='verbose logging')
     parser.add_argument('-d', '--debug', action='store_true', help='print traceback')
     parser.add_argument('-p', '--pause', action='store_true', help='pause before exit')
+    parser.add_argument('--lockfile', type=str, help='prevent second start')
+    parser.add_argument('--lockwait', type=int, default=3600, help='wait for lockfile (seconds)')
     args = parser.parse_args()
 
     for inifile in args.config:
         logging.config.fileConfig(inifile)
+        logging.captureWarnings(True)
+        warnings.formatwarning = formatwarning
         break
 
     if args.debug:
@@ -948,12 +1156,13 @@ def main():
         if args.debug:
             logger.exception("Got Exception")
         else:
-            logger.error(e)
+            logger.error(repr(e))
         exit_code = 1
 
     if args.pause:
-        print "Press Enter to continue..."
-        raw_input()
+        sys.stdout.write("Press Enter to continue...")
+        sys.stdout.flush()
+        input()
 
     logger.debug("Exit with code %d", exit_code)
 
