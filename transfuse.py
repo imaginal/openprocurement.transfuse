@@ -14,6 +14,7 @@ import munch
 import peewee
 import requests
 import warnings
+import signal
 import socket
 import six
 import zlib
@@ -31,9 +32,11 @@ except ImportError:
 assert peewee.__version__ >= '3.1'
 
 
-__version__ = '3.0.3'
+__version__ = '3.1'
 
 logger = logging.getLogger('transfuse')
+
+transfuse_app = None
 
 if sys.version_info[0] < 3:
     input = raw_input
@@ -86,11 +89,16 @@ class MyApiClient(object):
             self.session.auth = tuple(config['auth'].split(':', 1))
         elif 'key' in config:
             self.session.auth = (config['key'], '')
+        accept_encoding = config.get('accept_encoding', 'gzip,deflate')
         user_agent = "Transfuse/%s %s" % (__version__, config['user_agent'])
-        self.session.headers.update({'User-Agent': user_agent})
+        self.session.headers.update({
+            'Accept-Encoding': accept_encoding,
+            'User-Agent': user_agent})
         self.preload_limit = int(config.get('preload', 0))
+        self.limit_rps = float(config.get('limit_rps', 9.9))
         self.max_retry = int(config.get('max_retry', 5))
         self.use_cookies = int(config.get('use_cookies', 1))
+        self.next_request_time = 0
         if self.use_cookies:
             self.request_cookie()
 
@@ -106,8 +114,16 @@ class MyApiClient(object):
     def set_offset(self, offset):
         self.params['offset'] = offset
 
+    def wait_before_request(self):
+        if self.limit_rps:
+            now = time.time()
+            if self.next_request_time > now:
+                time.sleep(self.next_request_time - now)
+            self.next_request_time = 1.0 / self.limit_rps + now
+
     def request_cookie(self):
-        self.session.head(self.prefix_path, timeout=self.timeout)
+        self.wait_before_request()
+        self.session.get(self.prefix_path, timeout=self.timeout)
         logger.debug("Cookie: %s", self.session.cookies.items())
 
     def preload(self, feed='', limit=0, callback=None):
@@ -142,6 +158,7 @@ class MyApiClient(object):
         params['feed'] = feed
         for i in range(self.max_retry):
             try:
+                self.wait_before_request()
                 self.params.update(params)
                 response = self.session.get(self.prefix_path,
                     params=self.params, timeout=self.timeout)
@@ -169,6 +186,7 @@ class MyApiClient(object):
             try:
                 if self.use_cookies and not self.session.cookies:
                     self.request_cookie()
+                self.wait_before_request()
                 response = self.session.get(url, timeout=self.timeout)
 
                 if response.status_code == 404:
@@ -332,6 +350,7 @@ class TendersToSQL(object):
         'feed': "",
         'offset': None,
         'limit': None,
+        'alive': False,
         'resume': False,
         'ignore': False,
         'preload': 0,
@@ -394,6 +413,7 @@ class TendersToSQL(object):
         'digits': 'max_digits', 'decimal': 'decimal_places',
         'enc': 'encoding', 'charset': 'encoding', 'trunc': 'truncate',
         'name': 'column_name'}
+    last_tender_id = None
 
     def __init__(self, config, args):
         db_class = config.get('server', 'class')
@@ -463,7 +483,7 @@ class TendersToSQL(object):
         for key in ('lockfile', 'lockwait'):
             if getattr(args, key, None):
                 self.general_config[key] = getattr(args, key)
-        for key in ('offset', 'limit', 'resume'):
+        for key in ('offset', 'limit', 'resume', 'alive'):
             if getattr(args, key, None):
                 self.client_config[key] = getattr(args, key)
         for key in ('no_cache', 'drop_cache', 'fill_cache', 'verbose', 'debug'):
@@ -910,10 +930,10 @@ class TendersToSQL(object):
             root_name = table_options.get('__root__', 'root')
             root_id = getattr(model_class, '%s_id' % root_name)
             deleted = model_class.delete().where(root_id == tender.id).execute()
-            logger.log(self.loglevel, "Delete child %s %d rows", table_options['__path__'], deleted)
+            logger.debug("Delete child %s %d rows", table_options['__path__'], deleted)
         else:
             deleted = model_class.delete().where(model_class.id == tender.id).execute()
-            logger.log(self.loglevel, "Delete root %s %d row", model_class.model_name(), deleted)
+            logger.debug("Delete root %s %d row", model_class.model_name(), deleted)
 
     def tender_exists(self, tender, delete=False):
         try:
@@ -926,28 +946,32 @@ class TendersToSQL(object):
             return None
 
         if found and delete:
-            logger.log(self.loglevel, "Delete %s %s", found.id, found.dateModified)
+            logger.debug("Delete %s %s", found.id, found.dateModified)
             self.total_deleted += 1
             with self.database.transaction():
                 for model_class in reversed(self.sorted_models):
                     self.delete_model_data(model_class, tender)
+            found = False
         return found
 
     def process_tender(self, tender):
-        if self.client_config['resume'] and self.tender_exists(tender, delete=True):
-            logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
-            self.total_exists += 1
-            return
-        if self.client_config['ignore'] and self.tender_exists(tender, delete=False):
-            logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
-            self.total_exists += 1
-            return
+        self.last_tender_id = tender.id
+        if self.client_config['resume']:
+            if self.tender_exists(tender, delete=True):
+                logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
+                self.total_exists += 1
+                return
+        elif self.client_config['ignore']:
+            if self.tender_exists(tender, delete=False):
+                logger.log(self.loglevel, "Exists %s %s", tender.id, tender.dateModified)
+                self.total_exists += 1
+                return
         data = self.get_from_cache(tender)
         if not data:
             data = self.client.get(tender.id)
             self.save_to_cache(tender, data)
         if self.fill_cache:
-            logger.log(self.loglevel, "Save %s %s", tender.id, tender.dateModified)
+            logger.log(self.loglevel, "Store %s %s", tender.id, tender.dateModified)
             return
         if not self.process_filters(self.main_model, data):
             logger.log(self.loglevel, "Filter %s %s", tender.id, tender.dateModified)
@@ -968,6 +992,7 @@ class TendersToSQL(object):
                 logger.debug("%s: %s", repr(e), message)
                 six.reraise(type(e), type(e)(message), sys.exc_info()[2])
                 raise
+        self.last_tender_id = None
         return True
 
     def ping_db_connection(self):
@@ -1054,12 +1079,15 @@ class TendersToSQL(object):
         while not stop:
             tenders_list = self.client.preload(feed=feed, callback=self.onpreload)
 
-            if not tenders_list:
-                logger.info("No more records.")
-                break
-
             if self.db_ping:
                 self.ping_db_connection()
+
+            if not tenders_list:
+                if self.client_config['alive']:
+                    time.sleep(10)
+                    continue
+                logger.info("No more records.")
+                break
 
             for tender in tenders_list:
                 if self.total_listed - last_total >= 10000:
@@ -1100,20 +1128,29 @@ class TendersToSQL(object):
 def formatwarning(message, category, filename, lineno, line=None):
     if len(filename) > 30:
         filename = "..." + filename[-27:]
+    if transfuse_app and transfuse_app.last_tender_id:
+        message = "%s rootID=%s" % (message, transfuse_app.last_tender_id)
     return "%s:%s: %s: %s" % (filename, lineno, category.__name__, message)
 
 
 def run_app(args):
+    global transfuse_app
     config = MyConfigParser(allow_no_value=True)
     for inifile in args.config:
         config.test(inifile)
         config.read(inifile)
 
     app = TendersToSQL(config, args)
+    transfuse_app = app
     try:
         app.run()
     finally:
         app.close()
+
+
+def term_handler(signum, frame):
+    logger.warning("Signal %d received", signum)
+    sys.exit(1)
 
 
 def main():
@@ -1122,6 +1159,7 @@ def main():
     parser.add_argument('config', nargs='+', help='ini file(s)')
     parser.add_argument('-o', '--offset', type=str, help='client api offset')
     parser.add_argument('-l', '--limit', type=int, help='client api limit')
+    parser.add_argument('-a', '--alive', action='store_true', help='run infinitely')
     parser.add_argument('-r', '--resume', action='store_true', help='dont drop table')
     parser.add_argument('-i', '--ignore', action='store_true', help='ignore errors')
     parser.add_argument('-x', '--drop-cache', action='store_true', help="clear cache")
@@ -1133,6 +1171,8 @@ def main():
     parser.add_argument('--lockfile', type=str, help='prevent second start')
     parser.add_argument('--lockwait', type=int, default=3600, help='wait for lockfile (seconds)')
     args = parser.parse_args()
+
+    signal.signal(signal.SIGTERM, term_handler)
 
     for inifile in args.config:
         logging.config.fileConfig(inifile)
