@@ -80,6 +80,8 @@ class MyApiClient(object):
         self.params = {'limit': 1000, 'mode': ''}
         if config.get('mode', '') in ('test', '_all_'):
             self.params['mode'] = config['mode']
+        if config.get('descending'):
+            self.params['descending'] = config['descending']
         if 'list_limit' in config:
             self.params['limit'] = int(config['list_limit'])
         self.timeout = float(config.get('timeout', 30))
