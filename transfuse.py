@@ -845,7 +845,7 @@ class TendersToSQL(object):
                     value = self.parse_iso_datetime(value)
                 fields[name] = value
             except Exception as e:
-                message = "%s on field '%s' table [%s] itemID=%s" % (str(e),
+                message = "%s on field '%s' table [%s] id=%s" % (str(e),
                     name, model_class.model_name(), data.get('id'))
                 if extraopts and 'ignore' in extraopts:
                     logger.error("%s: %s (ignored)", type(e).__name__, message)
@@ -898,7 +898,7 @@ class TendersToSQL(object):
                 if not self.process_signle_filter(opts, data):
                     return False
             except Exception as e:
-                message = "%s on table [%s] filter %s itemID=%s" % (str(e),
+                message = "%s on table [%s] filter %s id=%s" % (str(e),
                     str(model_class.model_name()), str(opts), data.get('id'))
                 logger.debug("%s: %s", repr(e), message)
                 six.reraise(type(e), type(e)(message), sys.exc_info()[2])
@@ -983,7 +983,7 @@ class TendersToSQL(object):
                     self.process_model_data(model_class, data)
                 self.total_inserted += 1
             except Exception as e:
-                message = "%s table [%s] rootID=%s" % (str(e),
+                message = "%s table [%s] id=%s" % (str(e),
                     model_class.model_name(), data.get('id'))
                 if self.ignore_errors:
                     logger.error("%s: %s (ignored)", type(e).__name__, message)
@@ -1129,7 +1129,7 @@ def formatwarning(message, category, filename, lineno, line=None):
     if len(filename) > 30:
         filename = "..." + filename[-27:]
     if transfuse_app and transfuse_app.last_tender_id:
-        message = "%s rootID=%s" % (message, transfuse_app.last_tender_id)
+        message = "%s id=%s" % (message, transfuse_app.last_tender_id)
     return "%s:%s: %s: %s" % (filename, lineno, category.__name__, message)
 
 
